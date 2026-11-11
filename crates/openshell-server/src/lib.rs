@@ -1,0 +1,4225 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! `OpenShell` Server library.
+//!
+//! This crate provides the server implementation for `OpenShell`, including:
+//! - gRPC service implementation
+//! - HTTP health endpoints
+//! - Protocol multiplexing (gRPC + HTTP on same port)
+//! - mTLS support
+//!
+//! Compiled-in compute drivers are installed into a registry at gateway
+//! startup. Runtime selection only consults that registry or a configured
+//! external endpoint; it does not switch on driver names.
+
+mod auth;
+mod bus_sweeper;
+pub mod certgen;
+pub mod cli;
+mod compute;
+mod config_delivery;
+pub mod config_file;
+mod config_update_operation;
+mod credential_store;
+mod credentials;
+mod defaults;
+mod gateway_listener;
+mod gateway_members;
+mod gateway_metrics;
+mod gateway_ocsf;
+mod gateway_ring;
+mod grpc;
+mod http;
+mod middleware;
+mod multiplex;
+mod network_trust;
+mod ocsf_log;
+mod otel_tracing;
+mod pagination;
+mod persistence;
+pub(crate) mod policy_store;
+mod provider_profile_sources;
+mod provider_refresh;
+mod readiness;
+mod reflection;
+mod refresh_commit;
+mod refresh_store;
+mod sandbox_index;
+mod sandbox_watch;
+mod service_routing;
+mod ssh_identity;
+mod ssh_sessions;
+mod storage_proto;
+mod supervisor_owner;
+mod supervisor_pool;
+pub mod supervisor_session;
+mod telemetry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+mod tls;
+#[cfg(test)]
+pub(crate) mod tls_test_utils;
+pub mod tracing_bus;
+mod tracing_setup;
+mod watch_cursor;
+mod ws_tunnel;
+
+use axum::Router;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+    service::TowerToHyperService,
+};
+use openshell_core::net::set_tcp_nodelay_best_effort;
+use openshell_core::telemetry::TelemetryComputeDriver;
+use openshell_core::{Config, Error, NetworkSupervisorTrustBundle, ObjectLabels, Result};
+use openshell_extension_core::{
+    BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
+};
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
+use openshell_supervisor_middleware::MiddlewareRegistry;
+use std::collections::{BTreeMap, HashMap};
+use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::LazyLock;
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use tracing::{debug, error, info, warn};
+
+/// Serializes tests that assert on captured spans, which share one exporter.
+#[cfg(test)]
+pub(crate) static TEST_TRACING_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+pub(crate) fn install_jsonwebtoken_crypto_provider() {
+    openshell_crypto::install_jwt_provider();
+}
+
+use compute::ComputeRuntime;
+use gateway_listener::{BoundGatewayListener, bind_gateway_listener};
+pub use grpc::OpenShellService;
+pub use http::{health_router, http_router, metrics_router, service_http_router};
+
+/// Deriving `Debug` is safe here: `BearerTokenSlot` renders only its expiry,
+/// and an extension audience is configuration rather than secret material.
+#[derive(Debug)]
+struct GatewayExtensionCredential {
+    name: String,
+    audience: ExtensionAudience,
+    slot: BearerTokenSlot,
+    ttl: Duration,
+}
+
+fn extension_token_ttl(issuer: &auth::sandbox_jwt::ExtensionJwtIssuer) -> Duration {
+    issuer.token_ttl().min(MAX_EXTENSION_TOKEN_TTL)
+}
+
+/// Mint the gateway-caller credential for one extension registration.
+///
+/// Returns `Ok(None)` when the operator has explicitly opted the registration
+/// out of extension authentication. The opt-out is deliberately loud: it
+/// downgrades a security boundary, so it is reported once per registration at
+/// startup rather than being silently tolerated.
+fn mint_gateway_extension_credential(
+    issuer: &Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
+    kind: ExtensionKind,
+    name: &str,
+    audience: &str,
+    endpoint: &str,
+    allow_insecure_transport: bool,
+) -> Result<Option<GatewayExtensionCredential>> {
+    // A middleware endpoint must be reachable from sandbox supervisors, so a
+    // gateway-local Unix socket is only an option for interceptors.
+    let (accepted, supports_unix) = match kind {
+        ExtensionKind::Middleware => ("https://", false),
+        ExtensionKind::Interceptor => ("https:// or unix://", true),
+        _ => {
+            return Err(Error::config(format!(
+                "extension kind '{kind}' is not supported by gateway authentication"
+            )));
+        }
+    };
+    if allow_insecure_transport {
+        warn!(
+            extension = %name,
+            endpoint = %endpoint,
+            "extension authentication is DISABLED for this registration by \
+             allow_insecure_transport; OpenShell attaches no caller credential \
+             and the service cannot distinguish OpenShell from any other \
+             network client. Use {accepted} with the opt-out removed outside \
+             trusted-network development deployments."
+        );
+        return Ok(None);
+    }
+    let transport_supported =
+        endpoint.starts_with("https://") || (supports_unix && endpoint.starts_with("unix://"));
+    if !transport_supported {
+        return Err(Error::config(format!(
+            "authenticated {kind} '{name}' must use {accepted}; set \
+             allow_insecure_transport = true to opt this registration out of \
+             extension authentication instead"
+        )));
+    }
+    let audience = ExtensionAudience::new(audience.to_string()).map_err(|error| {
+        Error::config(format!(
+            "extension '{name}' has an invalid audience: {error}"
+        ))
+    })?;
+    let ttl = extension_token_ttl(issuer);
+    let minted = issuer
+        .mint_extension_token(&audience, ExtensionCallerKind::Gateway, None, ttl)
+        .map_err(|status| {
+            Error::config(format!(
+                "failed to mint credential for extension '{name}': {}",
+                status.message()
+            ))
+        })?;
+    let slot = BearerTokenSlot::new(&minted.token, minted.expires_at_ms).map_err(|error| {
+        Error::config(format!(
+            "failed to install credential for extension '{name}': {error}"
+        ))
+    })?;
+    Ok(Some(GatewayExtensionCredential {
+        name: name.to_string(),
+        audience,
+        slot,
+        ttl,
+    }))
+}
+
+fn spawn_gateway_extension_token_refresh(
+    issuer: Arc<auth::sandbox_jwt::ExtensionJwtIssuer>,
+    credentials: Vec<GatewayExtensionCredential>,
+) {
+    if credentials.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+                });
+            let remaining_ms = credentials
+                .iter()
+                .filter_map(|credential| credential.slot.expires_at_ms())
+                .min()
+                .map_or(60_000, |expiry_ms| expiry_ms.saturating_sub(now_ms));
+            let refresh_delay = if remaining_ms <= 0 {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_millis(
+                    u64::try_from(remaining_ms)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(4)
+                        .checked_div(5)
+                        .unwrap_or(100)
+                        .max(100),
+                )
+            };
+            tokio::time::sleep(refresh_delay).await;
+            for credential in &credentials {
+                match issuer.mint_extension_token(
+                    &credential.audience,
+                    ExtensionCallerKind::Gateway,
+                    None,
+                    credential.ttl,
+                ) {
+                    Ok(minted) => {
+                        if let Err(error) =
+                            credential.slot.update(&minted.token, minted.expires_at_ms)
+                        {
+                            warn!(
+                                extension = %credential.name,
+                                error = %error,
+                                "failed to rotate gateway extension credential"
+                            );
+                        }
+                    }
+                    Err(status) => warn!(
+                        extension = %credential.name,
+                        error = %status,
+                        "failed to mint gateway extension credential"
+                    ),
+                }
+            }
+        }
+    });
+}
+
+/// Mint the shared supervisor's token and renew it at half its lifetime so
+/// the delivered copy is never close to expiry when the supervisor restarts
+/// or reconnects. Minting failures are logged and retried shortly.
+fn spawn_supervisor_token_refresh(
+    authority: Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+    ttl: Duration,
+    controller: openshell_supervisor_control::SupervisorHostController,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let delay = match authority.mint_supervisor_token(ttl) {
+                Ok(minted) => {
+                    let remaining = minted.expires_at.saturating_sub(
+                        i64::try_from(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |elapsed| elapsed.as_secs()),
+                        )
+                        .unwrap_or(i64::MAX),
+                    );
+                    controller.publish_credential(
+                        openshell_supervisor_control::SupervisorCredential {
+                            token: minted.token,
+                            expires_at: minted.expires_at,
+                        },
+                    );
+                    Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
+                        .max(Duration::from_secs(1))
+                }
+                Err(error) => {
+                    warn!(%error, "failed to mint the supervisor token; retrying");
+                    Duration::from_secs(10)
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+pub use auth::audit::ConnectionSource;
+pub use multiplex::{MultiplexService, MultiplexedService};
+pub use otel_tracing::gateway_trace_headers;
+use otel_tracing::supervisor_otlp_headers;
+pub use persistence::Store;
+use sandbox_index::SandboxIndex;
+use sandbox_watch::SandboxWatchBus;
+pub use tls::TlsAcceptor;
+use tracing_bus::TracingLogBus;
+
+pub(crate) struct ServerStartupConfig {
+    pub config: Config,
+    pub config_file: Option<config_file::ConfigFile>,
+    pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
+    pub network_trust: Option<NetworkSupervisorTrustBundle>,
+    pub compute_driver: ComputeDriverSelection,
+    pub legacy_compute_driver_env_seen: bool,
+}
+
+/// Server state shared across handlers.
+#[derive(Debug)]
+pub struct ServerState {
+    /// Server configuration.
+    pub config: Config,
+
+    /// Persistence store.
+    pub store: Arc<Store>,
+
+    /// Compute orchestration over the configured driver.
+    pub compute: ComputeRuntime,
+
+    /// Credential-driver selection and resolution runtime.
+    pub credentials: credentials::CredentialRuntime,
+
+    /// Shared embedded refresh runtime (separate from storage-only consumers).
+    pub(crate) refresh: openshell_credential_issuer::refresh::RefreshRuntime,
+
+    /// In-memory sandbox correlation index.
+    pub sandbox_index: SandboxIndex,
+
+    /// In-memory bus for sandbox update notifications.
+    pub sandbox_watch_bus: SandboxWatchBus,
+
+    /// In-memory bus for server process logs.
+    pub tracing_log_bus: TracingLogBus,
+
+    /// In-memory anonymous telemetry accounting for active sandbox sessions.
+    pub(crate) telemetry: telemetry::TelemetryState,
+
+    /// Active SSH tunnel connection counts per session token.
+    pub ssh_connections_by_token: Mutex<HashMap<String, u32>>,
+
+    /// Active SSH tunnel connection counts per sandbox id.
+    pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
+
+    /// Active service forward connection counts per sandbox id.
+    pub service_connections_by_sandbox: Mutex<HashMap<String, u32>>,
+
+    /// Registry of active supervisor sessions and pending relay channels.
+    ///
+    /// Stored as `Arc` so compiled compute drivers can be constructed before
+    /// `ServerState` and still
+    /// query session state to surface supervisor readiness.
+    pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+
+    /// Set once graceful gateway shutdown begins so stream handlers can
+    /// distinguish expected transport closes from runtime failures.
+    pub(crate) gateway_shutting_down: AtomicBool,
+    /// Per-session delivery tasks for supervisor configuration.
+    pub(crate) config_delivery: config_delivery::ConfigDelivery,
+
+    /// Stable identity for this gateway process.
+    pub replica_id: String,
+
+    /// Internal endpoint other gateway replicas can dial for peer RPCs.
+    pub peer_endpoint: Option<String>,
+
+    /// Reused peer connections, peer token, and owner lookups for relay
+    /// forwarding. Keeps per-relay cost off the connection and auth paths.
+    pub peer_routes: Arc<supervisor_session::PeerRouteCache>,
+
+    /// Idle HTTP/1 upstreams to sandbox services, so routed requests reuse a
+    /// relay instead of opening one per request.
+    pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
+
+    /// In-memory hostname-to-service index for opaque service routing labels.
+    pub service_route_index: Arc<service_routing::ServiceRouteIndex>,
+
+    /// Latest placement ring, refreshed from live gateway membership. Decides
+    /// which replica *should* own a sandbox; the owner record in the store
+    /// remains authoritative for which one does.
+    pub gateway_ring: Arc<std::sync::RwLock<gateway_ring::GatewayRing>>,
+
+    /// Peer endpoints of live replicas, keyed by replica ID. Refreshed
+    /// alongside `gateway_ring` so a redirect can name a dialable address.
+    pub gateway_peers: Arc<std::sync::RwLock<HashMap<String, String>>>,
+
+    /// Validated built-in and operator-registered supervisor middleware.
+    pub middleware_registry: Arc<MiddlewareRegistry>,
+
+    /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
+    pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
+
+    /// Typed extension JWT issuer and public verification metadata.
+    pub extension_jwt_issuer: Option<Arc<auth::sandbox_jwt::ExtensionJwtIssuer>>,
+
+    /// Launch-scoped gateway and Sandbox Protocol token authority.
+    pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
+
+    /// Optional selected-driver authenticator for the `IssueSandboxToken`
+    /// bootstrap path.
+    pub compute_driver_authenticator: Option<Arc<auth::compute_driver::ComputeDriverAuthenticator>>,
+
+    /// Optional K8s `ServiceAccount` authenticator for gateway peer RPCs.
+    pub peer_authenticator: Option<Arc<auth::peer::PeerServiceAccountAuthenticator>>,
+
+    /// Credentials that have recently logged on, so each records one
+    /// authentication success rather than one per request.
+    pub(crate) logons: auth::audit::Logons,
+
+    /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
+    pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Immutable public reflection index and its per-query rate limiter.
+    pub(crate) reflection_service: reflection::GatewayReflectionServer,
+
+    /// Per-sandbox bound on extension credential minting, which resolves the
+    /// caller's effective policy on every request.
+    pub(crate) extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter,
+
+    /// Immutable gateway interceptor execution plan. `None` when disabled.
+    pub(crate) gateway_interceptors:
+        Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
+
+    /// Gateway-local provider profile sources. User-imported profiles are read
+    /// on demand when the user source is configured.
+    pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
+
+    /// OIDC admin role name for workspace-level authorization.
+    /// Empty when OIDC is not configured — `authorize_workspace()` treats
+    /// every authenticated user as Platform Admin in that case.
+    pub admin_role: String,
+}
+
+fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+    )
+}
+
+const METRICS_TLS_HANDSHAKE_WARNING_INTERVAL: Duration = Duration::from_mins(1);
+
+#[derive(Default)]
+struct MetricsTlsHandshakeLogState {
+    last_warning: Option<Instant>,
+    suppressed: u64,
+}
+
+struct MetricsTlsHandshakeLogLimiter {
+    interval: Duration,
+    state: Mutex<MetricsTlsHandshakeLogState>,
+    rejected: AtomicU64,
+}
+
+impl MetricsTlsHandshakeLogLimiter {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(MetricsTlsHandshakeLogState::default()),
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, now: Instant) -> Option<u64> {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .last_warning
+            .is_none_or(|last_warning| now.duration_since(last_warning) >= self.interval)
+        {
+            state.last_warning = Some(now);
+            return Some(std::mem::take(&mut state.suppressed));
+        }
+        state.suppressed += 1;
+        None
+    }
+}
+
+/// Separate limiters for handshake rejections and timeouts so a burst of one
+/// kind cannot absorb the other's warnings, and each periodic WARN reports
+/// counts for a single event type.
+#[derive(Clone)]
+struct MetricsTlsHandshakeLogLimiters {
+    rejections: Arc<MetricsTlsHandshakeLogLimiter>,
+    timeouts: Arc<MetricsTlsHandshakeLogLimiter>,
+}
+
+impl MetricsTlsHandshakeLogLimiters {
+    fn new(interval: Duration) -> Self {
+        Self {
+            rejections: Arc::new(MetricsTlsHandshakeLogLimiter::new(interval)),
+            timeouts: Arc::new(MetricsTlsHandshakeLogLimiter::new(interval)),
+        }
+    }
+}
+
+fn log_metrics_tls_handshake_rejection(
+    limiter: &MetricsTlsHandshakeLogLimiter,
+    error: &std::io::Error,
+    client: SocketAddr,
+) {
+    debug!(
+        event = "metrics_tls_handshake_rejected",
+        error = %error,
+        client = %client,
+        "Rejected metrics TLS handshake"
+    );
+    if let Some(suppressed) = limiter.record(Instant::now()) {
+        warn!(
+            event = "metrics_tls_handshake_rejected",
+            suppressed,
+            total = limiter.rejected.load(Ordering::Relaxed),
+            "Rejected metrics TLS handshakes; verify that clients use HTTPS and, when client authentication is enabled, certificates trusted by the metrics client CA"
+        );
+    }
+}
+
+fn log_metrics_tls_handshake_timeout(limiter: &MetricsTlsHandshakeLogLimiter, client: SocketAddr) {
+    debug!(
+        event = "metrics_tls_handshake_timed_out",
+        client = %client,
+        "Metrics TLS handshake timed out"
+    );
+    if let Some(suppressed) = limiter.record(Instant::now()) {
+        warn!(
+            event = "metrics_tls_handshake_timed_out",
+            suppressed,
+            total = limiter.rejected.load(Ordering::Relaxed),
+            "Metrics TLS handshakes timed out"
+        );
+    }
+}
+
+fn metrics_tls_acceptor_or_disable(
+    metrics_tls: &openshell_core::MetricsTlsConfig,
+) -> Option<TlsAcceptor> {
+    match TlsAcceptor::from_files(
+        &metrics_tls.cert_path,
+        &metrics_tls.key_path,
+        metrics_tls.client_ca_path.as_deref(),
+        metrics_tls.require_client_auth,
+        None,
+        None,
+        Vec::new(),
+    ) {
+        Ok(acceptor) => Some(acceptor),
+        Err(error) => {
+            error!(
+                event = "metrics_tls_listener_disabled",
+                listener = "metrics",
+                error = %error,
+                "Metrics TLS listener disabled because its certificate material could not be loaded"
+            );
+            let event = ConfigStateChangeBuilder::new(&gateway_ocsf::context("", ""))
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .state(StateId::Disabled, "initialization_failed")
+                .message(format!(
+                    "metrics TLS listener disabled because certificate material could not be loaded: {error}"
+                ))
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
+            None
+        }
+    }
+}
+
+fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
+    openshell_core::transport_errors::is_expected_transport_close_error(error)
+}
+
+impl ServerState {
+    /// Create new server state.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        config: Config,
+        store: Arc<Store>,
+        compute: ComputeRuntime,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+        oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
+    ) -> Self {
+        let credentials =
+            credentials::CredentialRuntime::from_config_with_store(&config, Arc::clone(&store))
+                .expect("server config should be validated before ServerState::new");
+        Self::new_with_credentials(
+            config,
+            store,
+            compute,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            oidc_cache,
+            credentials,
+        )
+    }
+
+    /// Create new server state with an already-initialized credential runtime.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_credentials(
+        config: Config,
+        store: Arc<Store>,
+        compute: ComputeRuntime,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+        oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
+        credentials: credentials::CredentialRuntime,
+    ) -> Self {
+        let replica_id = compute::lease::replica_id();
+        let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
+        compute.configure_ssh_identities(credentials.clone());
+        let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
+            config.service_routing_discriminator().map(str::to_string),
+        ));
+        compute.configure_service_route_index(Arc::clone(&service_route_index));
+        let peer_endpoint = derive_peer_endpoint(&config);
+        let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
+        let reflection_service = reflection::build_gateway_reflection_service(&config)
+            .expect("compiled public gateway descriptors must be valid");
+        let admin_role = config
+            .oidc
+            .as_ref()
+            .map_or_else(String::new, |oidc| oidc.admin_role.clone());
+        let config_delivery =
+            config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
+        let refresh = provider_refresh::runtime(&store, Some(&credentials), Some(&compute));
+        Self {
+            config,
+            store,
+            compute,
+            credentials,
+            refresh,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            telemetry: telemetry::TelemetryState::new(),
+            ssh_connections_by_token: Mutex::new(HashMap::new()),
+            ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
+            service_connections_by_sandbox: Mutex::new(HashMap::new()),
+            supervisor_sessions,
+            gateway_shutting_down: AtomicBool::new(false),
+            config_delivery,
+            replica_id,
+            peer_endpoint,
+            peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
+            service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
+            service_route_index,
+            gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
+            gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
+            middleware_registry: Arc::new(MiddlewareRegistry::default()),
+            oidc_cache,
+            extension_jwt_issuer: None,
+            sandbox_session_jwt_authority: None,
+            compute_driver_authenticator: None,
+            peer_authenticator: None,
+            logons: auth::audit::Logons::default(),
+            grpc_rate_limiter,
+            reflection_service,
+            gateway_interceptors: None,
+            provider_profile_sources:
+                provider_profile_sources::ProviderProfileSources::with_default_sources(),
+            admin_role,
+        }
+    }
+}
+
+fn derive_peer_endpoint(config: &Config) -> Option<String> {
+    if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
+        && !endpoint.trim().is_empty()
+    {
+        return Some(endpoint.trim().to_string());
+    }
+
+    let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
+    let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok()?;
+    let service = std::env::var("OPENSHELL_PEER_SERVICE_NAME").ok()?;
+    if pod_name.trim().is_empty() || namespace.trim().is_empty() || service.trim().is_empty() {
+        return None;
+    }
+
+    let scheme = if config.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    Some(format!(
+        "{scheme}://{pod}.{service}.{namespace}.svc.cluster.local:{port}",
+        pod = pod_name.trim(),
+        service = service.trim(),
+        namespace = namespace.trim(),
+        port = config.bind_address.port()
+    ))
+}
+
+/// Reject a plaintext peer endpoint on a gateway that serves TLS.
+///
+/// Peer relay traffic carries whole supervisor sessions between replicas. The
+/// chart renders a plaintext peer endpoint only when the gateway itself serves
+fn validate_peer_endpoint_scheme(config: &Config, peer_endpoint: &str) -> Result<()> {
+    if peer_endpoint.starts_with("https://") {
+        return Ok(());
+    }
+    if config.tls.is_some() {
+        return Err(Error::config(format!(
+            "gateway peer endpoint {peer_endpoint} is plaintext but this gateway serves TLS; \
+             set an https:// OPENSHELL_PEER_ENDPOINT so peer relay traffic is not downgraded"
+        )));
+    }
+    warn!(
+        peer_endpoint,
+        "gateway peer relay traffic is plaintext because this gateway does not serve TLS"
+    );
+    Ok(())
+}
+
+/// Run the `OpenShell` server.
+///
+/// This starts a multiplexed gRPC/HTTP server on the configured bind address.
+///
+/// # Errors
+///
+/// Returns an error if the server fails to start or encounters a fatal error.
+pub(crate) async fn run_server(
+    startup: ServerStartupConfig,
+    tracing_log_bus: TracingLogBus,
+    compute_drivers: ComputeDriverRegistry,
+) -> Result<()> {
+    let ServerStartupConfig {
+        config,
+        config_file,
+        guest_tls,
+        network_trust,
+        compute_driver,
+        legacy_compute_driver_env_seen: _,
+    } = startup;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    auth::descriptor_authz::init()
+        .map_err(|error| Error::config(format!("invalid gRPC authorization metadata: {error}")))?;
+
+    let database_url = config.database_url.trim();
+    if database_url.is_empty() {
+        return Err(Error::config("database_url is required"));
+    }
+
+    // Load signing material before connecting remote extensions so their
+    // startup Describe calls can authenticate with gateway-caller tokens.
+    let (extension_jwt_issuer, sandbox_session_jwt_authority) =
+        if let Some(ref jwt) = config.gateway_jwt {
+            let authorities = auth::launch_signing::load(jwt)?;
+            info!(
+                gateway_id = %jwt.gateway_id,
+                ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
+                "gateway-minted sandbox JWT enabled"
+            );
+            (
+                Some(authorities.extension),
+                Some(authorities.sandbox_session),
+            )
+        } else {
+            (None, None)
+        };
+
+    let middleware_registrations = config_file
+        .as_ref()
+        .map(|file| {
+            file.openshell
+                .supervisor
+                .middleware
+                .iter()
+                .map(openshell_core::proto::SupervisorMiddlewareService::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?
+        .unwrap_or_default();
+    let mut gateway_extension_credentials = Vec::new();
+    let middleware_registry = Arc::new(
+        if let Some(issuer) = extension_jwt_issuer.as_ref() {
+            let mut slots = HashMap::new();
+            for registration in &middleware_registrations {
+                if let Some(credential) = mint_gateway_extension_credential(
+                    issuer,
+                    ExtensionKind::Middleware,
+                    &registration.name,
+                    &registration.audience,
+                    &registration.grpc_endpoint,
+                    registration.allow_insecure_transport,
+                )? {
+                    slots.insert(registration.name.clone(), credential.slot.clone());
+                    gateway_extension_credentials.push(credential);
+                }
+            }
+            MiddlewareRegistry::connect_services_authenticated(
+                openshell_supervisor_middleware_builtins::services(),
+                middleware_registrations,
+                &slots,
+            )
+            .await
+        } else {
+            MiddlewareRegistry::connect_services(
+                openshell_supervisor_middleware_builtins::services(),
+                middleware_registrations,
+            )
+            .await
+        }
+        .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
+    );
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut health_listener = HealthListener::new(config.health_bind_address);
+    let Some(store) = connect_store(
+        &config,
+        database_url,
+        &mut health_listener,
+        shutdown.as_mut(),
+    )
+    .await?
+    else {
+        info!("Shutdown signal received while waiting for the database; stopping gateway");
+        return Ok(());
+    };
+    let store = Arc::new(store);
+    let credentials = credentials::CredentialRuntime::from_config_file_with_store(
+        &config,
+        config_file.as_ref(),
+        Arc::clone(&store),
+    )
+    .await?;
+
+    let oidc_cache = if let Some(ref oidc) = config.oidc {
+        // Validate RBAC configuration before starting.
+        let policy = auth::authz::AuthzPolicy {
+            admin_role: oidc.admin_role.clone(),
+            user_role: oidc.user_role.clone(),
+            scopes_enabled: !oidc.scopes_claim.is_empty(),
+        };
+        policy.validate().map_err(Error::config)?;
+
+        let cache = auth::oidc::JwksCache::new(oidc)
+            .await
+            .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
+        info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
+        Some(Arc::new(cache))
+    } else {
+        None
+    };
+
+    let sandbox_index = SandboxIndex::new();
+    let sandbox_watch_bus = SandboxWatchBus::new();
+    let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
+    let driver_startup = compute::driver_config::DriverStartupContext {
+        file: config_file.as_ref(),
+        guest_tls: guest_tls.as_ref(),
+        network_trust: network_trust.as_ref(),
+        network_trust_configured: network_trust.is_some(),
+        gateway_port: config.bind_address.port(),
+        gateway_tls_enabled: config.tls.is_some(),
+        endpoint_overrides: &config.compute_driver_endpoints,
+    };
+    let compute = build_compute_runtime(
+        &compute_drivers,
+        &compute_driver,
+        &config,
+        driver_startup,
+        store.clone(),
+        sandbox_index.clone(),
+        sandbox_watch_bus.clone(),
+        tracing_log_bus.clone(),
+        supervisor_sessions.clone(),
+        shutdown_rx.clone(),
+    )
+    .await?;
+    compute.configure_supervisor_otlp_headers(supervisor_otlp_headers(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref()),
+    ));
+    compute.configure_supervisor_otlp_tls(otel_tracing::supervisor_otlp_tls(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref()),
+    ));
+    let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
+        let mut slots = BTreeMap::new();
+        for interceptor in &config.gateway_interceptors {
+            let audience = interceptor.resolved_audience();
+            if let Some(credential) = mint_gateway_extension_credential(
+                issuer,
+                ExtensionKind::Interceptor,
+                &interceptor.name,
+                audience.as_ref(),
+                &interceptor.grpc_endpoint,
+                interceptor.allow_insecure_transport,
+            )? {
+                slots.insert(interceptor.name.clone(), credential.slot.clone());
+                gateway_extension_credentials.push(credential);
+            }
+        }
+        openshell_gateway_interceptors::initialize_authenticated(
+            config.gateway_interceptors.clone(),
+            slots,
+        )
+        .await
+    } else {
+        openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone()).await
+    }
+    .map_err(|e| Error::config(format!("gateway interceptor initialization failed: {e}")))?;
+    // Push delivery needs the refresh to notice catalog changes, so only push
+    // mode serves interceptor profiles from a cached snapshot.
+    let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
+        &config.provider_profile_sources,
+        gateway_interceptors.as_ref(),
+        (config.config_delivery_mode == openshell_core::config::ConfigDeliveryMode::Push)
+            .then_some(provider_profile_sources::PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL),
+    )
+    .map_err(|err| {
+        Error::config(format!(
+            "provider profile source configuration failed: {err}"
+        ))
+    })?;
+    info!(
+        sources = ?provider_profile_sources.source_ids(),
+        "provider profile sources configured"
+    );
+    // Builds read cached interceptor snapshots, so fetch them before serving.
+    provider_profile_sources.refresh_cached(&store).await;
+    let mut state = ServerState::new_with_credentials(
+        config.clone(),
+        store.clone(),
+        compute,
+        sandbox_index,
+        sandbox_watch_bus,
+        tracing_log_bus,
+        supervisor_sessions,
+        oidc_cache,
+        credentials,
+    );
+    state.middleware_registry = middleware_registry;
+    state.gateway_interceptors = gateway_interceptors;
+    state.provider_profile_sources = provider_profile_sources;
+    state.extension_jwt_issuer = extension_jwt_issuer.clone();
+    state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
+    if let Some(issuer) = extension_jwt_issuer {
+        spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
+    }
+    // The shared supervisor authenticates with a token this gateway mints
+    // from its launch-signing key and carries only over TLS, so the topology
+    // needs both.
+    if let Some(controller) = state.compute.supervisor_host() {
+        let (authority, jwt) = state
+            .sandbox_session_jwt_authority
+            .clone()
+            .zip(config.gateway_jwt.as_ref())
+            .ok_or_else(|| {
+                Error::config(
+                    "the shared supervisor requires gateway_jwt signing material to mint \
+                     supervisor tokens; configure [openshell.gateway.gateway_jwt] or disable \
+                     supervisor_topology",
+                )
+            })?;
+        if config.tls.is_none() {
+            return Err(Error::config(
+                "the shared supervisor requires gateway TLS; its token travels only over TLS. \
+                 Enable TLS or disable supervisor_topology",
+            ));
+        }
+        let ttl = jwt.token_ttl().clamp(
+            openshell_core::jwt::MIN_SESSION_TOKEN_TTL,
+            openshell_core::jwt::MAX_SESSION_TOKEN_TTL,
+        );
+        info!(
+            ttl_secs = ttl.as_secs(),
+            "shared supervisor assignment stream enabled; minting supervisor tokens"
+        );
+        info!("shared supervisor pool enabled; reconciling pool membership and ownership");
+        // Sandbox sessions dial this endpoint with their tokens.
+        if let Some(peer_endpoint) = state.peer_endpoint.as_deref() {
+            validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+        }
+        controller.set_peer_endpoint(state.peer_endpoint.clone().unwrap_or_default());
+        supervisor_pool::SupervisorPool::new(
+            state.store.clone(),
+            controller.clone(),
+            authority.clone(),
+            state.credentials.clone(),
+            state.replica_id.clone(),
+        )
+        .start(shutdown_rx.clone());
+        spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
+    }
+
+    if state.sandbox_session_jwt_authority.is_some()
+        && state.compute.supports_sandbox_authentication()
+    {
+        state.compute_driver_authenticator = Some(Arc::new(
+            auth::compute_driver::ComputeDriverAuthenticator::new(state.compute.clone()),
+        ));
+        info!(
+            driver = state.compute.configured_driver_name(),
+            "compute-driver sandbox bootstrap authenticator enabled"
+        );
+    }
+
+    let peer_routing_expected = state.peer_endpoint.is_some() && !state.store.is_single_replica();
+    if let Some(peer_endpoint) = state.peer_endpoint.as_deref()
+        && peer_routing_expected
+    {
+        validate_peer_endpoint_scheme(&state.config, peer_endpoint)?;
+    }
+    if state.peer_endpoint.is_none() && !state.store.is_single_replica() {
+        warn!(
+            "no gateway peer endpoint configured; this replica owns its supervisor sessions but \
+             peers cannot reach it. Single-gateway deployments are unaffected; set \
+             OPENSHELL_PEER_ENDPOINT on every replica when running more than one."
+        );
+    }
+
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok();
+        let service_account = std::env::var("OPENSHELL_SERVICE_ACCOUNT_NAME").ok();
+        match (namespace, service_account) {
+            (Some(namespace), Some(service_account))
+                if !namespace.trim().is_empty() && !service_account.trim().is_empty() =>
+            {
+                let required_labels =
+                    auth::peer::required_pod_labels_from_env().map_err(Error::config)?;
+                match kube::Client::try_default().await {
+                    Ok(client) => {
+                        let audience = auth::peer::peer_token_audience_from_env();
+                        let resolver = Arc::new(auth::peer::LiveGatewayPeerResolver::new(
+                            client,
+                            namespace.trim(),
+                            audience.clone(),
+                            service_account.trim().to_string(),
+                            required_labels,
+                        ));
+                        let cache_ttl = auth::peer::peer_token_cache_ttl_from_env();
+                        let resolver = Arc::new(auth::peer::CachingGatewayPeerResolver::new(
+                            resolver, cache_ttl,
+                        ));
+                        let authenticator =
+                            auth::peer::PeerServiceAccountAuthenticator::new(resolver);
+                        state.peer_authenticator = Some(Arc::new(authenticator));
+                        info!(
+                            namespace = %namespace.trim(),
+                            service_account = %service_account.trim(),
+                            audience,
+                            token_cache_ttl_secs = cache_ttl.as_secs(),
+                            "gateway peer ServiceAccount TokenReview authentication enabled"
+                        );
+                    }
+                    Err(err) if peer_routing_expected => {
+                        return Err(Error::config(format!(
+                            "in-cluster K8s client construction failed ({err}); \
+                             gateway peer authentication is required because \
+                             OPENSHELL_PEER_ENDPOINT is configured"
+                        )));
+                    }
+                    Err(err) => warn!(
+                        error = %err,
+                        "in-cluster K8s client construction failed; \
+                         gateway peer ServiceAccount authentication is disabled"
+                    ),
+                }
+            }
+            _ if peer_routing_expected => {
+                return Err(Error::config(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     both are required for gateway peer authentication because \
+                     OPENSHELL_PEER_ENDPOINT is configured"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                debug!(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     gateway peer ServiceAccount authentication disabled"
+                );
+            }
+        }
+    } else if peer_routing_expected {
+        return Err(Error::config(
+            "OPENSHELL_PEER_ENDPOINT is configured but the gateway is not running in a \
+             Kubernetes cluster, so gateway peer authentication is unavailable"
+                .to_string(),
+        ));
+    }
+
+    let state = Arc::new(state);
+
+    // Install the recorder before the endpoint-status startup reconciliation so
+    // the lock waits and timeouts recorded there are exported. Its listener
+    // binds with the others.
+    let metrics_endpoint = config
+        .metrics_bind_address
+        .map(|metrics_bind_address| {
+            gateway_metrics::install_global_recorder(
+                supervisor_session::RELAY_CAPACITY,
+                store.mutation_lock_connections(),
+            )
+            .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))
+        })
+        .transpose()
+        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+
+    grpc::policy::backfill_legacy_policy_history(&state)
+        .await
+        .map_err(|error| Error::execution(error.to_string()))?;
+
+    // Reconcile local-driver running intent before watchers spawn so their
+    // first snapshots observe the post-start backend state. Explicitly stopped
+    // sandboxes remain stopped.
+    ensure_default_workspace(&store).await?;
+    state
+        .service_route_index
+        .rebuild(&state.store)
+        .await
+        .map_err(|error| Error::config(format!("service routing index rebuild failed: {error}")))?;
+    grpc::policy::validate_provider_composition_startup_preflight(&state)
+        .await
+        .map_err(|error| {
+            Error::config(format!(
+                "provider policy composition startup preflight failed: {}",
+                error.message()
+            ))
+        })?;
+    grpc::policy::invalidate_endpoint_status_on_startup(&state)
+        .await
+        .map_err(|error| {
+            Error::execution(format!(
+                "tool server endpoint-status startup reconciliation failed: {}",
+                error.message()
+            ))
+        })?;
+
+    let gateway_listener = bind_gateway_listener(config.bind_address).await?;
+
+    // Create the multiplexed service
+    let service = MultiplexService::new(state.clone());
+
+    health_listener.serve(store.clone()).await?;
+
+    // Bind the Prometheus metrics endpoint on a dedicated port when configured.
+    if let Some((metrics_bind_address, prometheus_handle)) = metrics_endpoint {
+        if let Some(metrics_tls) = &config.metrics_tls {
+            if let Some(metrics_tls_acceptor) = metrics_tls_acceptor_or_disable(metrics_tls) {
+                let metrics_listener =
+                    TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                        Error::transport(format!(
+                            "failed to bind metrics port {metrics_bind_address}: {e}",
+                        ))
+                    })?;
+                metrics_tls_acceptor
+                    .spawn_reload_worker_for_listener(shutdown_rx.clone(), "metrics");
+
+                info!(address = %metrics_bind_address, "Metrics TLS server listening");
+                tokio::spawn(serve_tls_metrics_listener(
+                    metrics_listener,
+                    metrics_router(prometheus_handle),
+                    metrics_tls_acceptor,
+                    shutdown_rx.clone(),
+                ));
+            } else {
+                warn!(
+                    listener = "metrics",
+                    "Metrics listener remains unavailable until valid TLS certificate material is provided"
+                );
+            }
+        } else {
+            let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                Error::transport(format!(
+                    "failed to bind metrics port {metrics_bind_address}: {e}",
+                ))
+            })?;
+            info!(address = %metrics_bind_address, "Metrics server listening");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(
+                    metrics_listener,
+                    metrics_router(prometheus_handle).into_make_service(),
+                )
+                .await
+                {
+                    error!("Metrics server error: {e}");
+                }
+            });
+        }
+    } else {
+        info!("Metrics server disabled");
+    }
+
+    // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
+    let tls_acceptor = if let Some(tls) = &config.tls {
+        let acceptor = TlsAcceptor::from_files(
+            &tls.cert_path,
+            &tls.key_path,
+            tls.client_ca_path.as_deref(),
+            tls.require_client_auth,
+            tls.external_cert_path.as_deref(),
+            tls.external_key_path.as_deref(),
+            tls.external_server_names.clone(),
+        )?;
+
+        // Spawn file-watcher-based TLS certificate reload worker.
+        // Watches parent directories of cert/key/CA files and atomically
+        // reloads when changes are detected.
+        acceptor.spawn_reload_worker(shutdown_rx.clone());
+
+        Some(acceptor)
+    } else {
+        info!("TLS disabled — accepting plaintext connections");
+        None
+    };
+
+    let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
+    let listener_task = tokio::spawn(serve_gateway_listener(
+        gateway_listener,
+        service.clone(),
+        tls_acceptor.clone(),
+        enable_loopback_service_http,
+        shutdown_rx.clone(),
+    ));
+
+    // Deadlines must run while restored supervisors wait for policy repair.
+    let (startup_tx, startup_rx) = watch::channel(false);
+    state.compute.spawn_watchers(
+        shutdown_rx.clone(),
+        startup_rx,
+        state.sandbox_session_jwt_authority.clone(),
+    );
+
+    // Serve the gateway before reconciling persisted sandboxes so restored
+    // supervisors can fetch policy and register their sessions.
+    if let Err(err) = state
+        .compute
+        .start_persisted_sandboxes_with_authentication(
+            |sandbox| {
+                let state = state.clone();
+                let sandbox = sandbox.clone();
+                async move {
+                    if state.sandbox_session_jwt_authority.is_none() {
+                        return Ok(Vec::new());
+                    }
+                    let authentication = grpc::mint_persisted_authentication(&state, &sandbox)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    serde_json::to_vec(&authentication)
+                        .map_err(|error| format!("encode launch authentication: {error}"))
+                }
+            },
+            |_| async { Ok(()) },
+            |_| {},
+        )
+        .await
+    {
+        warn!(error = %err, "Failed to start persisted sandboxes during startup");
+    }
+
+    startup_tx.send_replace(true);
+    // The poller and sweeper exist to observe writes made by other replicas.
+    // Single-replica backends have none, so they would only add load.
+    if !store.is_single_replica() {
+        sandbox_watch::spawn_store_poller(
+            store.clone(),
+            state.sandbox_watch_bus.clone(),
+            sandbox_watch::DEFAULT_STORE_POLL_INTERVAL,
+            shutdown_rx.clone(),
+        );
+        bus_sweeper::spawn(
+            store.clone(),
+            state.tracing_log_bus.clone(),
+            shutdown_rx.clone(),
+        );
+    }
+    let membership_worker = gateway_members::spawn_membership_worker(
+        state.clone(),
+        gateway_members::MEMBER_REFRESH_INTERVAL,
+        shutdown_rx.clone(),
+    );
+    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
+    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    grpc::service_advertisement::spawn_cleanup(state.clone(), shutdown_rx.clone());
+    provider_profile_sources::spawn_refresh(state.clone());
+    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
+
+    shutdown.await;
+    info!("Shutdown signal received; stopping gateway");
+    state.gateway_shutting_down.store(true, Ordering::Release);
+    state.supervisor_sessions.close_admission();
+    let _ = shutdown_tx.send(true);
+
+    if let Err(err) = listener_task.await {
+        warn!(error = %err, "Gateway listener task failed during shutdown");
+    }
+
+    let compute_cleanup = state.compute.cleanup_on_shutdown().await;
+    // Closing sessions redirect their supervisors through the ring. Let the
+    // membership worker finish pointing it at the remaining replicas first.
+    if let Some(worker) = membership_worker
+        && tokio::time::timeout(gateway_members::SHUTDOWN_MEMBERSHIP_TIMEOUT, worker)
+            .await
+            .is_err()
+    {
+        warn!("Gateway membership worker did not finish leaving the ring before session shutdown");
+    }
+    // A stopped supervisor may still have a detached task deleting its owner
+    // record. Drain it even when compute cleanup failed before exiting Tokio.
+    let session_cleanup = state
+        .supervisor_sessions
+        .shutdown(supervisor_session::SUPERVISOR_SESSION_SHUTDOWN_TIMEOUT)
+        .await;
+    if let Err(err) = &session_cleanup {
+        warn!(error = %err, "Gateway supervisor session cleanup incomplete");
+    }
+    compute_cleanup
+        .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
+    session_cleanup.map_err(Error::execution)?;
+
+    Ok(())
+}
+
+/// Serve the metrics endpoint through a dedicated TLS listener.
+///
+/// This listener exists only when `metrics_tls` is configured. The default
+/// metrics listener remains plaintext for backwards compatibility.
+async fn serve_tls_metrics_listener(
+    listener: TcpListener,
+    router: Router,
+    tls_acceptor: TlsAcceptor,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let handshake_log_limiters =
+        MetricsTlsHandshakeLogLimiters::new(METRICS_TLS_HANDSHAKE_WARNING_INTERVAL);
+    loop {
+        let accepted = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, addr) = match accepted {
+            Ok(connection) => connection,
+            Err(error) => {
+                error!(error = %error, "Failed to accept metrics connection");
+                continue;
+            }
+        };
+        set_tcp_nodelay_best_effort(&stream);
+
+        let acceptor = tls_acceptor.clone();
+        let service = TowerToHyperService::new(router.clone());
+        let handshake_log_limiters = handshake_log_limiters.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(10), acceptor.acceptor().accept(stream))
+                .await
+            {
+                Ok(Ok(tls_stream)) => {
+                    if let Err(error) = Builder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
+                        .await
+                    {
+                        if is_benign_connection_close(error.as_ref()) {
+                            debug!(error = %error, client = %addr, "Metrics connection closed");
+                        } else {
+                            error!(error = %error, client = %addr, "Metrics connection error");
+                        }
+                    }
+                }
+                Ok(Err(error)) if is_benign_tls_handshake_failure(&error) => {
+                    debug!(error = %error, client = %addr, "Metrics TLS handshake closed early");
+                }
+                Ok(Err(error)) => {
+                    log_metrics_tls_handshake_rejection(
+                        &handshake_log_limiters.rejections,
+                        &error,
+                        addr,
+                    );
+                }
+                Err(_) => {
+                    log_metrics_tls_handshake_timeout(&handshake_log_limiters.timeouts, addr);
+                }
+            }
+        });
+    }
+}
+
+async fn serve_gateway_listener(
+    bound_listener: BoundGatewayListener,
+    service: MultiplexService,
+    tls_acceptor: Option<TlsAcceptor>,
+    enable_loopback_service_http: bool,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let BoundGatewayListener {
+        listener,
+        address: listen_addr,
+    } = bound_listener;
+
+    loop {
+        let accepted = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, addr) = match accepted {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!(error = %e, listen = %listen_addr, "Failed to accept connection");
+                continue;
+            }
+        };
+        set_tcp_nodelay_best_effort(&stream);
+
+        spawn_gateway_connection(
+            stream,
+            addr,
+            listen_addr,
+            service.clone(),
+            tls_acceptor.clone(),
+            enable_loopback_service_http,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionProtocol {
+    Tls,
+    PlainHttp,
+    Unknown,
+}
+
+async fn classify_connection_protocol(stream: &TcpStream) -> std::io::Result<ConnectionProtocol> {
+    let mut prefix = [0_u8; 8];
+    let read = stream.peek(&mut prefix).await?;
+    Ok(classify_initial_bytes(&prefix[..read]))
+}
+
+fn classify_initial_bytes(prefix: &[u8]) -> ConnectionProtocol {
+    if looks_like_tls(prefix) {
+        ConnectionProtocol::Tls
+    } else if looks_like_http(prefix) {
+        ConnectionProtocol::PlainHttp
+    } else {
+        ConnectionProtocol::Unknown
+    }
+}
+
+fn looks_like_tls(prefix: &[u8]) -> bool {
+    prefix.len() >= 3 && prefix[0] == 0x16 && prefix[1] == 0x03
+}
+
+fn looks_like_http(prefix: &[u8]) -> bool {
+    const METHODS: [&[u8]; 10] = [
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"PATCH ",
+        b"DELETE ",
+        b"HEAD ",
+        b"OPTIONS ",
+        b"TRACE ",
+        b"CONNECT ",
+        b"PRI ",
+    ];
+
+    if prefix.is_empty() {
+        return false;
+    }
+    METHODS
+        .iter()
+        .any(|method| method.starts_with(prefix) || prefix.starts_with(method))
+}
+
+fn allow_plaintext_service_http(
+    enabled: bool,
+    listen_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> bool {
+    enabled && listen_addr.ip().is_loopback() && peer_addr.ip().is_loopback()
+}
+
+fn spawn_gateway_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    listen_addr: SocketAddr,
+    service: MultiplexService,
+    tls_acceptor: Option<TlsAcceptor>,
+    enable_loopback_service_http: bool,
+) {
+    if let Some(acceptor) = tls_acceptor {
+        tokio::spawn(async move {
+            match classify_connection_protocol(&stream).await {
+                Ok(ConnectionProtocol::PlainHttp)
+                    if allow_plaintext_service_http(
+                        enable_loopback_service_http,
+                        listen_addr,
+                        addr,
+                    ) =>
+                {
+                    if let Err(e) = service.serve_service_http(stream).await {
+                        if is_benign_connection_close(e.as_ref()) {
+                            debug!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection closed");
+                        } else {
+                            error!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection error");
+                        }
+                    }
+                }
+                Ok(ConnectionProtocol::PlainHttp) => {
+                    warn!(
+                        client = %addr,
+                        listen = %listen_addr,
+                        "Rejected plaintext HTTP on gateway listener"
+                    );
+                }
+                Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
+                    // acceptor.acceptor() snapshots the current TLS config;
+                    // the returned acceptor owns an Arc that stays alive for
+                    // the full duration of the handshake.
+                    match acceptor.acceptor().accept(stream).await {
+                        Ok(tls_stream) => {
+                            let peer_identity = multiplex::extract_peer_identity(&tls_stream);
+                            let certificate_sha256 =
+                                match multiplex::extract_peer_certificate_sha256(&tls_stream) {
+                                    Ok(fingerprint) => fingerprint,
+                                    Err(e) => {
+                                        error!(error = %e, client = %addr, "Failed to fingerprint peer certificate");
+                                        return;
+                                    }
+                                };
+                            if let Err(e) = service
+                                .serve_with_verified_certificate(
+                                    tls_stream,
+                                    peer_identity,
+                                    certificate_sha256,
+                                    ConnectionSource::Peer(addr),
+                                )
+                                .await
+                            {
+                                if is_benign_connection_close(e.as_ref()) {
+                                    debug!(error = %e, client = %addr, "Connection closed");
+                                } else {
+                                    error!(error = %e, client = %addr, "Connection error");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if is_benign_tls_handshake_failure(&e) {
+                                debug!(error = %e, client = %addr, "TLS handshake closed early");
+                            } else {
+                                error!(error = %e, client = %addr, "TLS handshake failed");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, client = %addr, "Failed to inspect connection preface");
+                }
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = service.serve(stream, ConnectionSource::Peer(addr)).await {
+                if is_benign_connection_close(e.as_ref()) {
+                    debug!(error = %e, client = %addr, "Connection closed");
+                } else {
+                    error!(error = %e, client = %addr, "Connection error");
+                }
+            }
+        });
+    }
+}
+
+/// First delay between attempts to reach an unreachable database at startup.
+const DATABASE_CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// Longest delay between attempts to reach an unreachable database at startup.
+const DATABASE_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+
+/// Connect to the database, retrying while it is unreachable.
+///
+/// The first failed attempt binds the health endpoint and starts listening
+/// for `shutdown`; a gateway running as PID 1 ignores SIGTERM until then.
+/// Returns `None` if `shutdown` completes first.
+async fn connect_store(
+    config: &Config,
+    database_url: &str,
+    health_listener: &mut HealthListener,
+    mut shutdown: std::pin::Pin<&mut impl Future<Output = ()>>,
+) -> Result<Option<Store>> {
+    let mut delay = DATABASE_CONNECT_RETRY_INITIAL_DELAY;
+    let mut waiting = false;
+    loop {
+        let attempt = Store::try_connect_with_pool_sizes(
+            database_url,
+            config.database_max_connections,
+            config.database_lock_max_connections,
+        );
+        let result = if waiting {
+            tokio::select! {
+                () = &mut shutdown => return Ok(None),
+                result = attempt => result?,
+            }
+        } else {
+            attempt.await?
+        };
+        let error = match result {
+            Ok(store) => return Ok(Some(store)),
+            Err(error @ persistence::PersistenceError::Unavailable(_)) => error,
+            Err(error) => return Err(Error::execution(error.to_string())),
+        };
+        if !waiting {
+            health_listener.bind().await?;
+            waiting = true;
+        }
+        warn!(
+            error = %error,
+            retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "database unreachable; retrying"
+        );
+        tokio::select! {
+            () = &mut shutdown => return Ok(None),
+            () = tokio::time::sleep(delay) => {}
+        }
+        delay = (delay * 2).min(DATABASE_CONNECT_RETRY_MAX_DELAY);
+    }
+}
+
+/// The unauthenticated health endpoint, served on its own port when
+/// configured.
+struct HealthListener {
+    address: Option<SocketAddr>,
+    state: Option<watch::Sender<readiness::HealthState>>,
+}
+
+impl HealthListener {
+    const fn new(address: Option<SocketAddr>) -> Self {
+        Self {
+            address,
+            state: None,
+        }
+    }
+
+    /// Start serving probes, with `/readyz` reporting `Initializing` until
+    /// [`Self::serve`] publishes the database's health.
+    async fn bind(&mut self) -> Result<()> {
+        let Some(address) = self.address else {
+            return Ok(());
+        };
+        if self.state.is_some() {
+            return Ok(());
+        }
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|e| Error::transport(format!("failed to bind health port {address}: {e}")))?;
+        info!(address = %address, "Health server listening");
+        let (sender, receiver) = watch::channel(readiness::HealthState::Initializing);
+        let router = http::health_router_from_receiver(receiver);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router.into_make_service()).await {
+                error!("Health server error: {e}");
+            }
+        });
+        self.state = Some(sender);
+        Ok(())
+    }
+
+    /// Bind if not yet serving and publish `store`'s health from now on.
+    async fn serve(mut self, store: Arc<Store>) -> Result<()> {
+        self.bind().await?;
+        if let Some(sender) = self.state {
+            readiness::DatabaseHealthMonitor::spawn_into(store, sender);
+        } else {
+            info!("Health server disabled");
+        }
+        Ok(())
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            () = ctrl_c_signal() => {}
+            () = terminate_signal() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c_signal().await;
+    }
+}
+
+async fn ctrl_c_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!(error = %err, "Failed to install Ctrl-C signal handler");
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_signal() {
+    let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        warn!("Failed to install SIGTERM signal handler");
+        std::future::pending::<()>().await;
+        return;
+    };
+    let _ = signal.recv().await;
+}
+
+pub use compute::{
+    AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
+    SharedComputeDriverAppEndpoints, SharedComputeDriverConfigurationUpdates,
+};
+
+/// Driver instance returned by a compiled compute-driver factory.
+pub enum ComputeDriverInstance {
+    /// A driver hosted in the gateway process.
+    InProcess(SharedComputeDriver),
+    /// A driver process launched and owned by the gateway.
+    ManagedRemote(AcquiredRemoteDriverEndpoint),
+}
+
+/// Factory for a compute driver linked into a gateway binary.
+#[async_trait::async_trait]
+pub trait ComputeDriverFactory: Send + Sync {
+    /// Resolve the driver's external-resource admission contract. Defaults to
+    /// the operator-configured policy, including secure admission defaults.
+    /// Drivers without resource-label support may override this explicitly.
+    fn admission_policy(
+        &self,
+        context: ComputeDriverConfigContext<'_>,
+    ) -> Result<openshell_core::resource_admission::DriverAdmissionConfig> {
+        compute::driver_config::admission_config_from_context(
+            context.driver_startup,
+            context.driver_name,
+        )
+    }
+
+    /// Validate selected-driver configuration without starting a driver,
+    /// connecting a transport, or modifying runtime state.
+    ///
+    /// The default preserves source compatibility for existing out-of-tree
+    /// factories during normal startup. Package preflight rejects a selected
+    /// factory unless [`Self::supports_config_preflight`] is also overridden
+    /// to return `true`.
+    fn validate_config(&self, _context: ComputeDriverConfigContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether [`Self::validate_config`] fully validates this factory's
+    /// configuration without runtime side effects.
+    fn supports_config_preflight(&self) -> bool {
+        false
+    }
+
+    /// Check locally installed host tools after configuration validation.
+    ///
+    /// Only the explicit `config preflight` command calls this hook. Probes
+    /// must bound time and output, clean up on cancellation, and avoid driver
+    /// startup, transport connections, images, and runtime state. Return
+    /// operator-readable results including the selected executable paths.
+    /// The process inherits the gateway's account and environment. When
+    /// `cancellation` becomes true, finish process cleanup before returning.
+    async fn preflight_host_tools(
+        &self,
+        _cancellation: watch::Receiver<bool>,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether this factory can propagate the gateway-owned destination trust
+    /// bundle to its network supervisor.
+    ///
+    /// The default is deliberately conservative: out-of-tree, remote, and
+    /// otherwise unannotated drivers must explicitly opt in before a
+    /// configured additional CA bundle can be used with them.
+    fn supports_network_supervisor_trust(&self) -> bool {
+        false
+    }
+
+    /// Whether this configuration hosts sandboxes on the gateway's shared
+    /// supervisor pool. Same constraints as [`Self::validate_config`].
+    fn uses_shared_supervision(&self, _context: ComputeDriverConfigContext<'_>) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
+
+    /// Build with a separately registered, optional in-process image updater.
+    ///
+    /// Existing factories only implement `build`; their baseline driver object
+    /// remains sufficient and this hook defaults to no configuration-update support.
+    /// Supporting factories return the same driver instance in both slots and
+    /// advertise the negotiated configuration-update capability. Remote drivers expose
+    /// their extension over the existing endpoint instead of using this hook.
+    async fn build_with_configuration_updates(
+        &self,
+        context: ComputeDriverBuildContext<'_>,
+    ) -> Result<(
+        ComputeDriverInstance,
+        Option<SharedComputeDriverConfigurationUpdates>,
+    )> {
+        self.build(context).await.map(|instance| (instance, None))
+    }
+}
+
+/// One named compiled-driver registration.
+#[derive(Clone)]
+pub struct ComputeDriverRegistration {
+    name: String,
+    detection_priority: u16,
+    detect: Option<fn() -> bool>,
+    factory: Arc<dyn ComputeDriverFactory>,
+    telemetry_category: TelemetryComputeDriver,
+    in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
+}
+
+impl std::fmt::Debug for ComputeDriverRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ComputeDriverRegistration")
+            .field("name", &self.name)
+            .field("detection_priority", &self.detection_priority)
+            .field("has_detection_probe", &self.detect.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ComputeDriverRegistration {
+    /// Define a compiled driver. Lower detection priorities are preferred.
+    pub fn new(
+        name: impl Into<String>,
+        detection_priority: u16,
+        detect: Option<fn() -> bool>,
+        factory: impl ComputeDriverFactory + 'static,
+    ) -> Result<Self> {
+        let name = openshell_core::config::normalize_compute_driver_name(&name.into())
+            .map_err(Error::config)?;
+        Ok(Self {
+            name,
+            detection_priority,
+            detect,
+            factory: Arc::new(factory),
+            telemetry_category: TelemetryComputeDriver::custom(),
+            in_process_tracing: None,
+        })
+    }
+
+    /// Assign a bounded telemetry category chosen by the binary composition
+    /// boundary. Runtime driver names are never used as telemetry values.
+    #[must_use]
+    pub fn with_telemetry_category(mut self, category: TelemetryComputeDriver) -> Self {
+        self.telemetry_category = category;
+        self
+    }
+
+    /// Attach process-wide tracing for this in-process compiled driver.
+    #[must_use]
+    pub fn with_in_process_tracing(
+        mut self,
+        tracing: openshell_otel::ComputeDriverTracing,
+    ) -> Self {
+        self.in_process_tracing = Some(tracing);
+        self
+    }
+
+    #[must_use]
+    pub fn in_process_tracing(&self) -> Option<openshell_otel::ComputeDriverTracing> {
+        self.in_process_tracing
+    }
+}
+
+/// Registry of compute drivers compiled into this gateway binary.
+///
+/// Like `SQLx`'s `Any` driver registry, installation is explicit at the binary
+/// composition boundary while runtime selection is generic.
+#[derive(Clone, Default)]
+pub struct ComputeDriverRegistry {
+    drivers: BTreeMap<String, ComputeDriverRegistration>,
+}
+
+#[derive(Clone, Debug)]
+struct ComputeDriverDetection {
+    available: Vec<String>,
+}
+
+impl ComputeDriverDetection {
+    fn selected(&self) -> Option<&str> {
+        self.available.first().map(String::as_str)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ComputeDriverSelection {
+    Configured { name: String },
+    AutoDetected(ComputeDriverDetection),
+}
+
+impl ComputeDriverSelection {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Configured { name } => name,
+            Self::AutoDetected(detection) => detection
+                .selected()
+                .expect("auto-detected selection has an available driver"),
+        }
+    }
+}
+
+impl ComputeDriverRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install a compiled driver factory.
+    pub fn install(&mut self, registration: ComputeDriverRegistration) -> Result<()> {
+        let name = registration.name.clone();
+        match self.drivers.entry(name.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(registration);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(Error::config(format!(
+                "compute driver '{name}' registered twice"
+            ))),
+        }
+    }
+
+    /// Names installed into this gateway binary, in lexical order.
+    pub fn installed_driver_names(&self) -> impl Iterator<Item = &str> {
+        self.drivers.keys().map(String::as_str)
+    }
+
+    /// Names whose runtime registrations participate in auto-detection.
+    ///
+    /// This does not execute detection probes. Package preflight uses it to
+    /// validate configured candidate tables without connecting local sockets
+    /// or starting discovery commands.
+    pub(crate) fn auto_detectable_driver_names(&self) -> impl Iterator<Item = &str> {
+        self.drivers
+            .values()
+            .filter(|registration| registration.detect.is_some())
+            .map(|registration| registration.name.as_str())
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&ComputeDriverRegistration> {
+        self.drivers.get(name)
+    }
+
+    fn in_process_tracing(
+        &self,
+        selection: &ComputeDriverSelection,
+        endpoint_overrides: &BTreeMap<String, PathBuf>,
+    ) -> Option<openshell_otel::ComputeDriverTracing> {
+        let name = selection.name();
+        if endpoint_overrides.contains_key(name) {
+            return None;
+        }
+        self.get(name)
+            .and_then(ComputeDriverRegistration::in_process_tracing)
+    }
+
+    fn detect(&self) -> ComputeDriverDetection {
+        let mut candidates = self
+            .drivers
+            .values()
+            .filter(|registration| registration.detect.is_some())
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.detection_priority
+                .cmp(&right.detection_priority)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let available = candidates
+            .into_iter()
+            .filter(|registration| registration.detect.is_some_and(|detect| detect()))
+            .map(|registration| registration.name.clone())
+            .collect();
+        ComputeDriverDetection { available }
+    }
+
+    pub(crate) fn select(&self, configured_driver: Option<&str>) -> Result<ComputeDriverSelection> {
+        match configured_driver {
+            None => {
+                let detection = self.detect();
+                if detection.selected().is_none() {
+                    return Err(Error::config(
+                        "no compute driver configured and auto-detection found no suitable installed \
+                        driver; set --compute-driver <name> or OPENSHELL_COMPUTE_DRIVER=<name>",
+                    ));
+                }
+                Ok(ComputeDriverSelection::AutoDetected(detection))
+            }
+            Some(driver) => {
+                let name = openshell_core::config::normalize_compute_driver_name(driver)
+                    .map_err(Error::config)?;
+                Ok(ComputeDriverSelection::Configured { name })
+            }
+        }
+    }
+}
+
+/// Read-only inputs available while validating a selected compute driver.
+///
+/// This context deliberately exposes no shutdown handle, runtime store, or
+/// transport client. Implementations must remain deterministic and must not
+/// start processes, connect sockets, or modify state.
+#[derive(Clone, Copy)]
+pub struct ComputeDriverConfigContext<'a> {
+    driver_name: &'a str,
+    gateway_name: &'a str,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &'a str,
+    driver_startup: compute::driver_config::DriverStartupContext<'a>,
+}
+
+impl ComputeDriverConfigContext<'_> {
+    #[must_use]
+    pub fn app_listener_config(&self) -> openshell_core::app_listener::AppListenerConfig {
+        self.driver_startup
+            .file
+            .map(|file| file.openshell.supervisor.app_listener.clone())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn driver_name(&self) -> &str {
+        self.driver_name
+    }
+
+    #[must_use]
+    pub fn gateway_name(&self) -> &str {
+        self.gateway_name
+    }
+
+    #[must_use]
+    pub fn gateway_bind_address(&self) -> SocketAddr {
+        self.gateway_bind_address
+    }
+
+    #[must_use]
+    pub fn gateway_log_level(&self) -> &str {
+        self.gateway_log_level
+    }
+
+    #[must_use]
+    pub fn gateway_port(&self) -> u16 {
+        self.driver_startup.gateway_port
+    }
+
+    #[must_use]
+    pub fn gateway_tls_enabled(&self) -> bool {
+        self.driver_startup.gateway_tls_enabled
+    }
+
+    /// Deserialize the selected driver's merged TOML table.
+    pub fn driver_config<T>(&self) -> Result<T>
+    where
+        T: Default + serde::de::DeserializeOwned,
+    {
+        compute::driver_config::driver_config_from_context(self.driver_startup, self.driver_name)
+    }
+}
+
+pub struct ComputeDriverBuildContext<'a> {
+    config: ComputeDriverConfigContext<'a>,
+    shutdown_rx: watch::Receiver<bool>,
+    shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
+    app_endpoint_resolver: &'a OnceLock<SharedComputeDriverAppEndpoints>,
+    /// Recovery deadline from `[openshell.gateway.supervisor_pool]`, when
+    /// configured.
+    supervisor_recovery_timeout_secs: Option<u32>,
+}
+
+impl ComputeDriverBuildContext<'_> {
+    /// Register an optional in-process application endpoint resolver during build.
+    /// Existing factories need not provide this extension.
+    pub fn register_app_endpoints(&self, resolver: SharedComputeDriverAppEndpoints) -> Result<()> {
+        self.app_endpoint_resolver
+            .set(resolver)
+            .map_err(|_| Error::config("application endpoint resolver already registered"))
+    }
+
+    /// The gateway's coordination of the shared supervisor pool, for an
+    /// in-process driver whose configuration places new generations on it.
+    /// The gateway owns the desired set and ownership durably, serves each
+    /// member over the private assignment stream, mints the supervisor
+    /// token, and publishes each renewal for the driver to deliver.
+    /// `[openshell.gateway.supervisor_pool]` only tunes it. Created on first
+    /// request; every call returns the same coordination.
+    pub fn shared_supervision(&self) -> openshell_supervisor_control::SharedSupervision {
+        self.shared_supervision
+            .get_or_init(|| {
+                let supervision = openshell_supervisor_control::SharedSupervision::new();
+                if let Some(recovery_timeout_secs) = self.supervisor_recovery_timeout_secs {
+                    supervision.set_recovery_timeout_secs(recovery_timeout_secs);
+                }
+                supervision
+            })
+            .clone()
+    }
+
+    #[must_use]
+    pub fn config_context(&self) -> ComputeDriverConfigContext<'_> {
+        self.config
+    }
+
+    #[must_use]
+    pub fn driver_name(&self) -> &str {
+        self.config.driver_name()
+    }
+
+    #[must_use]
+    pub fn gateway_name(&self) -> &str {
+        self.config.gateway_name()
+    }
+
+    #[must_use]
+    pub fn gateway_bind_address(&self) -> SocketAddr {
+        self.config.gateway_bind_address()
+    }
+
+    #[must_use]
+    pub fn gateway_log_level(&self) -> &str {
+        self.config.gateway_log_level()
+    }
+
+    #[must_use]
+    pub fn gateway_port(&self) -> u16 {
+        self.config.gateway_port()
+    }
+
+    #[must_use]
+    pub fn gateway_tls_enabled(&self) -> bool {
+        self.config.gateway_tls_enabled()
+    }
+
+    /// Gateway CA certificate that a local driver may provide to supervisors.
+    #[must_use]
+    pub fn guest_tls_ca(&self) -> Option<&Path> {
+        self.config
+            .driver_startup
+            .guest_tls
+            .map(compute::driver_config::GuestTlsPaths::as_path)
+    }
+
+    /// Gateway-normalized destination trust material for the network
+    /// supervisor. The bundle is absent when the global setting is omitted.
+    #[must_use]
+    pub fn network_trust_bundle(&self) -> Option<&NetworkSupervisorTrustBundle> {
+        self.config.driver_startup.network_trust
+    }
+
+    /// Deserialize the selected driver's merged TOML table.
+    pub fn driver_config<T>(&self) -> Result<T>
+    where
+        T: Default + serde::de::DeserializeOwned,
+    {
+        self.config.driver_config()
+    }
+
+    #[must_use]
+    pub fn shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.shutdown_rx.clone()
+    }
+
+    #[must_use]
+    pub fn otlp_config(&self) -> Option<&config_file::OtlpConfig> {
+        self.config
+            .driver_startup
+            .file
+            .and_then(|file| file.openshell.gateway.otlp.as_ref())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_compute_runtime(
+    registry: &ComputeDriverRegistry,
+    selection: &ComputeDriverSelection,
+    config: &Config,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+    store: Arc<Store>,
+    sandbox_index: SandboxIndex,
+    sandbox_watch_bus: SandboxWatchBus,
+    tracing_log_bus: TracingLogBus,
+    supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<ComputeRuntime> {
+    let isolation_backend = driver_startup
+        .file
+        .map(|file| file.isolation_backend(selection.name()))
+        .transpose()
+        .map_err(Error::config)?
+        .flatten();
+    if isolation_backend.is_some() && config.gateway_jwt.is_none() {
+        return Err(Error::config(
+            "external isolation backends require gateway launch signing; configure openshell.gateway.gateway_jwt or the package-managed local signing keys",
+        ));
+    }
+    let driver = validate_compute_driver_config(
+        registry,
+        selection.name(),
+        &config.name,
+        config.bind_address,
+        &config.log_level,
+        driver_startup,
+        false,
+    )?;
+    validate_supervisor_pool_consumer(
+        &driver,
+        &config.name,
+        config.bind_address,
+        &config.log_level,
+        driver_startup,
+    )?;
+    let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
+    let admission = match &driver {
+        ConfiguredComputeDriver::Registered(registration) => registration
+            .factory
+            .admission_policy(ComputeDriverConfigContext {
+                driver_name: &registration.name,
+                gateway_name: &config.name,
+                gateway_bind_address: config.bind_address,
+                gateway_log_level: &config.log_level,
+                driver_startup,
+            })?,
+        ConfiguredComputeDriver::Remote { name } => {
+            compute::driver_config::admission_config_from_context(driver_startup, name)?
+        }
+    };
+    info!(driver = %driver.name(), "Using compute driver");
+    let supervisor_pool = driver_startup
+        .file
+        .and_then(|file| file.openshell.gateway.supervisor_pool);
+    let runtime = match driver {
+        ConfiguredComputeDriver::Registered(registration) => {
+            let shared_supervision = OnceLock::new();
+            let app_endpoint_resolver = OnceLock::new();
+            let build_context = ComputeDriverBuildContext {
+                config: ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name: &config.name,
+                    gateway_bind_address: config.bind_address,
+                    gateway_log_level: &config.log_level,
+                    driver_startup,
+                },
+                shutdown_rx,
+                shared_supervision: &shared_supervision,
+                app_endpoint_resolver: &app_endpoint_resolver,
+                supervisor_recovery_timeout_secs: supervisor_pool
+                    .and_then(|pool| pool.recovery_timeout_secs),
+            };
+            let (instance, image_updates) = registration
+                .factory
+                .build_with_configuration_updates(build_context)
+                .await?;
+            let supervisor_host = shared_supervision
+                .into_inner()
+                .map(|supervision| supervision.controller().clone());
+            if supervisor_pool.is_some() && supervisor_host.is_none() {
+                return Err(Error::config(SUPERVISOR_POOL_WITHOUT_HOST));
+            }
+            match instance {
+                ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
+                    registration.name,
+                    driver,
+                    None,
+                    store,
+                    sandbox_index,
+                    sandbox_watch_bus,
+                    tracing_log_bus,
+                    supervisor_sessions,
+                )
+                .await
+                .map_err(|error| {
+                    Error::execution(format!("failed to create compute runtime: {error}"))
+                })?
+                .with_supervisor_host(supervisor_host)
+                .with_image_update_driver(image_updates)
+                .with_app_endpoint_resolver(app_endpoint_resolver.into_inner()),
+                ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
+                    return Err(Error::config(
+                        "only an in-process compute driver can use the gateway's shared supervision",
+                    ));
+                }
+                ComputeDriverInstance::ManagedRemote(mut endpoint) => {
+                    endpoint.name = registration.name;
+                    ComputeRuntime::new_remote_driver(
+                        endpoint,
+                        store,
+                        sandbox_index,
+                        sandbox_watch_bus,
+                        tracing_log_bus,
+                        supervisor_sessions,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Error::execution(format!("failed to create compute runtime: {error}"))
+                    })?
+                }
+            }
+        }
+        ConfiguredComputeDriver::Remote { name } => {
+            let remote_config =
+                compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
+            info!(
+                driver = %name,
+                socket = %remote_config.socket_path.display(),
+                "Using remote compute driver endpoint"
+            );
+            let endpoint = compute::connect_remote_compute_driver(name, &remote_config.socket_path)
+                .await
+                .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            ComputeRuntime::new_remote_driver(
+                endpoint,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?
+        }
+    };
+
+    let runtime = runtime
+        .with_isolation_backend(isolation_backend)
+        .and_then(|runtime| runtime.with_admission_policy(admission))
+        .and_then(|runtime| {
+            runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
+        })
+        .and_then(|runtime| {
+            runtime
+                .with_provisioning_repair_window_seconds(config.provisioning_repair_window_seconds)
+        })
+        .map_err(Error::config)?;
+    Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
+}
+
+#[derive(Debug, Clone)]
+enum ConfiguredComputeDriver {
+    Registered(ComputeDriverRegistration),
+    Remote { name: String },
+}
+
+impl ConfiguredComputeDriver {
+    fn name(&self) -> &str {
+        match self {
+            Self::Registered(registration) => &registration.name,
+            Self::Remote { name } => name,
+        }
+    }
+
+    fn telemetry_compute_driver(&self, registry: &ComputeDriverRegistry) -> TelemetryComputeDriver {
+        match self {
+            Self::Registered(registration) => registration.telemetry_category,
+            Self::Remote { name } => registry
+                .get(name)
+                .map_or_else(TelemetryComputeDriver::custom, |registration| {
+                    registration.telemetry_category
+                }),
+        }
+    }
+}
+
+#[cfg(test)]
+fn configured_compute_driver(
+    registry: &ComputeDriverRegistry,
+    config: &Config,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+) -> Result<ConfiguredComputeDriver> {
+    let selection = registry.select(config.compute_driver.as_deref())?;
+    resolve_configured_compute_driver(registry, selection.name(), driver_startup)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_compute_driver_config(
+    registry: &ComputeDriverRegistry,
+    driver_name: &str,
+    gateway_name: &str,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &str,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+    require_preflight_support: bool,
+) -> Result<ConfiguredComputeDriver> {
+    let driver = resolve_configured_compute_driver(registry, driver_name, driver_startup)?;
+    match &driver {
+        ConfiguredComputeDriver::Registered(registration) => {
+            if require_preflight_support && !registration.factory.supports_config_preflight() {
+                return Err(Error::config(format!(
+                    "compute driver '{}' does not support side-effect-free configuration preflight",
+                    registration.name
+                )));
+            }
+            registration
+                .factory
+                .validate_config(ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name,
+                    gateway_bind_address,
+                    gateway_log_level,
+                    driver_startup,
+                })?;
+        }
+        ConfiguredComputeDriver::Remote { name } => {
+            compute::driver_config::remote_driver_config_from_context(driver_startup, name)?;
+        }
+    }
+    Ok(driver)
+}
+
+const SUPERVISOR_POOL_WITHOUT_HOST: &str = "openshell.gateway.supervisor_pool tunes the shared \
+     supervisor pool, but no compute driver hosts sandboxes on it; set the Kubernetes driver's \
+     supervisor_topology = \"gateway\" or remove the table";
+
+/// Refuse `[openshell.gateway.supervisor_pool]` unless the selected driver
+/// hosts sandboxes on the shared supervisor pool.
+fn validate_supervisor_pool_consumer(
+    driver: &ConfiguredComputeDriver,
+    gateway_name: &str,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &str,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+) -> Result<()> {
+    if driver_startup
+        .file
+        .is_none_or(|file| file.openshell.gateway.supervisor_pool.is_none())
+    {
+        return Ok(());
+    }
+    match driver {
+        ConfiguredComputeDriver::Registered(registration) => {
+            if registration
+                .factory
+                .uses_shared_supervision(ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name,
+                    gateway_bind_address,
+                    gateway_log_level,
+                    driver_startup,
+                })?
+            {
+                Ok(())
+            } else {
+                Err(Error::config(SUPERVISOR_POOL_WITHOUT_HOST))
+            }
+        }
+        ConfiguredComputeDriver::Remote { .. } => Err(Error::config(
+            "openshell.gateway.supervisor_pool tunes the shared supervisor pool, which only an \
+             in-process compute driver can use; remove the table",
+        )),
+    }
+}
+
+fn resolve_configured_compute_driver(
+    registry: &ComputeDriverRegistry,
+    driver_name: &str,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+) -> Result<ConfiguredComputeDriver> {
+    let name = openshell_core::config::normalize_compute_driver_name(driver_name)
+        .map_err(Error::config)?;
+    let network_trust_configured =
+        driver_startup.network_trust.is_some() || driver_startup.network_trust_configured;
+    if network_trust_configured && driver_startup.endpoint_overrides.contains_key(&name) {
+        return Err(Error::config(format!(
+            "{} is configured but compute driver '{name}' uses an unsupported remote endpoint",
+            network_trust::CONFIG_FIELD
+        )));
+    }
+    // An operator-provided endpoint replaces normal construction for the
+    // selected name, including a compiled registration with the same name.
+    // The gateway connects to it; it does not provision the remote driver.
+    if driver_startup.endpoint_overrides.contains_key(&name) {
+        return Ok(ConfiguredComputeDriver::Remote { name });
+    }
+
+    if let Some(registration) = registry.get(&name) {
+        if network_trust_configured && !registration.factory.supports_network_supervisor_trust() {
+            return Err(Error::config(format!(
+                "{} is configured but compute driver '{name}' does not support network trust propagation",
+                network_trust::CONFIG_FIELD
+            )));
+        }
+        return Ok(ConfiguredComputeDriver::Registered(registration.clone()));
+    }
+
+    if network_trust_configured {
+        return Err(Error::config(format!(
+            "{} is configured but remote compute driver '{name}' is unsupported because it cannot propagate network trust",
+            network_trust::CONFIG_FIELD
+        )));
+    }
+    Ok(ConfiguredComputeDriver::Remote { name })
+}
+
+pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
+    use grpc::workspace::{DEFAULT_WORKSPACE_NAME, WORKSPACE_OBJECT_TYPE};
+    use openshell_core::proto::Workspace;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use prost::Message;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let workspace = Workspace {
+        metadata: Some(ObjectMeta {
+            id: id.clone(),
+            name: DEFAULT_WORKSPACE_NAME.to_string(),
+            created_time: openshell_core::time::timestamp_from_millis(
+                persistence::current_time_ms(),
+            )
+            .ok(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            resource_version: 0,
+            workspace: String::new(),
+            deletion_time: None,
+        }),
+        status: Some(openshell_core::proto::datamodel::v1::WorkspaceStatus {
+            phase: openshell_core::proto::datamodel::v1::WorkspacePhase::Active.into(),
+        }),
+    };
+
+    let labels_map = workspace.object_labels();
+    let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&labels_map).map_err(|e| Error::Config {
+                message: format!("failed to serialize labels: {e}"),
+            })?,
+        )
+    };
+    match store
+        .put_if(
+            WORKSPACE_OBJECT_TYPE,
+            &id,
+            DEFAULT_WORKSPACE_NAME,
+            "",
+            &workspace.encode_to_vec(),
+            labels_json.as_deref(),
+            persistence::WriteCondition::MustCreate,
+        )
+        .await
+    {
+        Ok(_) => {
+            info!("Created default workspace");
+            Ok(())
+        }
+        Err(persistence::PersistenceError::UniqueViolation { .. }) => {
+            debug!("Default workspace already exists");
+            Ok(())
+        }
+        Err(e) => Err(Error::config(format!(
+            "failed to ensure default workspace: {e}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod compute_factory_compatibility;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
+        MetricsTlsHandshakeLogLimiter, MetricsTlsHandshakeLogLimiters, MultiplexService,
+        ServerState, TlsAcceptor, allow_plaintext_service_http, bind_gateway_listener,
+        classify_initial_bytes, configured_compute_driver, extension_token_ttl,
+        is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
+        log_metrics_tls_handshake_timeout, metrics_tls_acceptor_or_disable,
+        mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
+        validate_peer_endpoint_scheme,
+    };
+    use axum::{Router, routing::get};
+    use openshell_core::{
+        Config, MetricsTlsConfig, NetworkSupervisorTrustBundle,
+        proto::{HealthRequest, open_shell_client::OpenShellClient},
+    };
+    use rcgen::{CertificateParams, KeyUsagePurpose};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::fs;
+    use std::io::{Error, ErrorKind};
+    use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
+    use std::sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant};
+    use tempfile::{TempDir, tempdir};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::watch;
+    use tokio_rustls::TlsConnector;
+
+    use crate::tls_test_utils::generate_test_certs_with_ca;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn tls_enabled_config() -> Config {
+        Config::new(Some(openshell_core::TlsConfig {
+            cert_path: "/tmp/cert.pem".into(),
+            key_path: "/tmp/key.pem".into(),
+            client_ca_path: None,
+            require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: Vec::new(),
+        }))
+    }
+
+    fn test_tls_connector(ca_path: &Path, client_auth: Option<(&Path, &Path)>) -> TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let certificates =
+            CertificateDer::pem_file_iter(ca_path).expect("failed to open test CA certificate");
+        for certificate in certificates {
+            roots
+                .add(certificate.expect("failed to parse test CA certificate"))
+                .expect("failed to add test CA certificate");
+        }
+
+        let config = if let Some((cert_path, key_path)) = client_auth {
+            let cert_chain = CertificateDer::pem_file_iter(cert_path)
+                .expect("failed to open test client certificate")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to parse test client certificate");
+            let private_key =
+                PrivateKeyDer::from_pem_file(key_path).expect("failed to parse test client key");
+
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(cert_chain, private_key)
+                    .expect("failed to configure test client certificate"),
+            )
+        } else {
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        };
+
+        TlsConnector::from(config)
+    }
+
+    fn write_test_client_certificate(
+        directory: &Path,
+        name: &str,
+        ca_cert: &openshell_crypto::pki::Certificate,
+        ca_key: &openshell_crypto::pki::KeyPair,
+    ) -> (PathBuf, PathBuf) {
+        let client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate test client key");
+        let mut client_params =
+            CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        client_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let client_cert =
+            openshell_crypto::pki::signed_by(client_params, &client_key, ca_cert, ca_key)
+                .expect("failed to sign test client certificate");
+
+        let cert_path = directory.join(format!("{name}-cert.pem"));
+        let key_path = directory.join(format!("{name}-key.pem"));
+        fs::write(&cert_path, client_cert.pem()).expect("failed to write test client certificate");
+        fs::write(
+            &key_path,
+            client_key
+                .serialize_pem()
+                .expect("failed to encode test client key"),
+        )
+        .expect("failed to write test client key");
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn plaintext_peer_endpoint_is_rejected_on_a_tls_gateway() {
+        let error = validate_peer_endpoint_scheme(&tls_enabled_config(), "http://10.0.0.1:8080")
+            .expect_err("plaintext peer endpoint must not be accepted alongside gateway TLS");
+        assert!(
+            error.to_string().contains("plaintext"),
+            "error should name the downgrade: {error}"
+        );
+    }
+
+    #[test]
+    fn https_peer_endpoint_is_accepted_on_a_tls_gateway() {
+        validate_peer_endpoint_scheme(&tls_enabled_config(), "https://10.0.0.1:8080").unwrap();
+    }
+
+    #[test]
+    fn plaintext_peer_endpoint_is_allowed_on_a_plaintext_gateway() {
+        let config = Config::new(None);
+        assert!(config.tls.is_none());
+        validate_peer_endpoint_scheme(&config, "http://10.0.0.1:8080").unwrap();
+    }
+
+    static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+
+    fn record_detection_probe(name: &'static str, available: bool) -> bool {
+        DETECTION_PROBE_ORDER.lock().unwrap().push(name);
+        available
+    }
+
+    fn unavailable_first_probe() -> bool {
+        record_detection_probe("first", false)
+    }
+
+    fn available_second_probe() -> bool {
+        record_detection_probe("second", true)
+    }
+
+    fn available_third_probe() -> bool {
+        record_detection_probe("third", true)
+    }
+
+    fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::ExtensionJwtIssuer> {
+        extension_test_issuer_with_ttl(Duration::from_mins(15))
+    }
+
+    fn extension_test_issuer_with_ttl(
+        ttl: Duration,
+    ) -> Arc<crate::auth::sandbox_jwt::ExtensionJwtIssuer> {
+        let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
+        Arc::new(
+            crate::auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
+                material.signing_key_pem.as_bytes(),
+                material.public_key_pem.as_bytes(),
+                material.kid,
+                "gateway-a",
+                ttl,
+            )
+            .expect("issuer"),
+        )
+    }
+
+    #[test]
+    fn gateway_ttl_bounds_extension_ttl() {
+        let issuer = extension_test_issuer_with_ttl(Duration::from_mins(15));
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_mins(15));
+    }
+
+    #[test]
+    fn extension_token_ttl_is_capped_at_one_hour() {
+        let issuer = extension_test_issuer_with_ttl(Duration::from_hours(24));
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_hours(1));
+
+        let short = extension_test_issuer_with_ttl(Duration::from_mins(5));
+        assert_eq!(extension_token_ttl(&short), Duration::from_mins(5));
+    }
+
+    #[test]
+    fn plaintext_extension_endpoint_is_rejected_unless_explicitly_opted_out() {
+        let issuer = extension_test_issuer();
+
+        // Default posture: a plaintext endpoint cannot carry a bearer
+        // credential, so startup fails and names the opt-out.
+        let error = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "http://host.openshell.internal:50051",
+            false,
+        )
+        .expect_err("plaintext endpoint must not silently downgrade");
+        assert!(error.to_string().contains("allow_insecure_transport"));
+
+        // Explicit opt-out starts the gateway with no credential attached.
+        assert!(
+            mint_gateway_extension_credential(
+                &issuer,
+                ExtensionKind::Middleware,
+                "content-guard",
+                "urn:openshell:extension:middleware:content-guard",
+                "http://host.openshell.internal:50051",
+                true,
+            )
+            .expect("opt-out must be permitted")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn authenticated_extension_endpoints_mint_a_credential() {
+        let issuer = extension_test_issuer();
+        let credential = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "https://content-guard.example:50051",
+            false,
+        )
+        .expect("credential")
+        .expect("authenticated endpoint mints a credential");
+        assert_eq!(credential.name, "content-guard");
+        assert!(credential.slot.expires_at_ms().is_some_and(|ms| ms > 0));
+
+        // Unix sockets are gateway-local, so only interceptors can use them.
+        // A middleware endpoint must also be reachable from every supervisor.
+        let error = mint_gateway_extension_credential(
+            &issuer,
+            ExtensionKind::Middleware,
+            "content-guard",
+            "urn:openshell:extension:middleware:content-guard",
+            "unix:///run/openshell/content-guard.sock",
+            false,
+        )
+        .expect_err("middleware cannot be reached over a gateway-local socket");
+        assert!(error.to_string().contains("must use https://"));
+
+        assert!(
+            mint_gateway_extension_credential(
+                &issuer,
+                ExtensionKind::Interceptor,
+                "quota",
+                "urn:openshell:extension:interceptor:quota",
+                "unix:///run/openshell/interceptors/quota.sock",
+                false,
+            )
+            .expect("credential")
+            .is_some()
+        );
+    }
+
+    fn test_driver_startup<'a>(
+        config: &'a Config,
+        file: Option<&'a super::config_file::ConfigFile>,
+    ) -> crate::compute::driver_config::DriverStartupContext<'a> {
+        test_driver_startup_with_bundle(config, file, None)
+    }
+
+    fn test_driver_startup_with_bundle<'a>(
+        config: &'a Config,
+        file: Option<&'a super::config_file::ConfigFile>,
+        network_trust: Option<&'a NetworkSupervisorTrustBundle>,
+    ) -> crate::compute::driver_config::DriverStartupContext<'a> {
+        crate::compute::driver_config::DriverStartupContext {
+            file,
+            guest_tls: None,
+            network_trust,
+            network_trust_configured: network_trust.is_some(),
+            gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            gateway_tls_enabled: false,
+            endpoint_overrides: &config.compute_driver_endpoints,
+        }
+    }
+
+    fn test_network_trust_bundle() -> NetworkSupervisorTrustBundle {
+        NetworkSupervisorTrustBundle::new(
+            b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n".to_vec(),
+            1,
+            "sha256:fixture",
+            "/tmp/openshell-additional-ca.crt".into(),
+        )
+    }
+
+    fn test_compute_drivers() -> super::ComputeDriverRegistry {
+        let mut registry = super::ComputeDriverRegistry::new();
+        for (name, priority) in [("alpha", 100), ("beta", 200), ("gamma", 300)] {
+            registry
+                .install(
+                    super::ComputeDriverRegistration::new(
+                        name,
+                        priority,
+                        None,
+                        TestComputeDriverFactory,
+                    )
+                    .unwrap()
+                    .with_telemetry_category(
+                        openshell_core::telemetry::TelemetryComputeDriver::anonymous_category(
+                            "registered",
+                        ),
+                    ),
+                )
+                .unwrap();
+        }
+        registry
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestComputeDriverFactory;
+
+    #[test]
+    fn shared_supervision_is_always_a_pool_tuned_by_its_table() {
+        let endpoint_overrides = std::collections::BTreeMap::new();
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        for (configured, offered) in [
+            (
+                None,
+                openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS,
+            ),
+            (Some(75), 75),
+        ] {
+            let shared = std::sync::OnceLock::new();
+            let context = super::ComputeDriverBuildContext {
+                config: super::ComputeDriverConfigContext {
+                    driver_name: "kubernetes",
+                    gateway_name: "test",
+                    gateway_bind_address: "127.0.0.1:8080".parse().unwrap(),
+                    gateway_log_level: "info",
+                    driver_startup: crate::compute::driver_config::DriverStartupContext {
+                        file: None,
+                        guest_tls: None,
+                        gateway_port: 8080,
+                        gateway_tls_enabled: true,
+                        network_trust: None,
+                        network_trust_configured: false,
+                        endpoint_overrides: &endpoint_overrides,
+                    },
+                },
+                shutdown_rx: shutdown_rx.clone(),
+                shared_supervision: &shared,
+                app_endpoint_resolver: &std::sync::OnceLock::new(),
+                supervisor_recovery_timeout_secs: configured,
+            };
+            // The driver asks for shared supervision as before; it is the
+            // pool, with the configured recovery deadline or the default.
+            let supervision = context.shared_supervision();
+            assert_eq!(
+                supervision.controller().pool_recovery_timeout_secs(),
+                offered
+            );
+            assert_eq!(
+                context
+                    .shared_supervision()
+                    .controller()
+                    .pool_recovery_timeout_secs(),
+                offered
+            );
+            assert!(shared.get().is_some());
+        }
+    }
+
+    #[test]
+    fn factory_admission_defaults_remain_enabled() {
+        use super::ComputeDriverFactory as _;
+        let endpoint_overrides = std::collections::BTreeMap::new();
+        let context = super::ComputeDriverConfigContext {
+            driver_name: "custom",
+            gateway_name: "test",
+            gateway_bind_address: "127.0.0.1:8080".parse().unwrap(),
+            gateway_log_level: "info",
+            driver_startup: crate::compute::driver_config::DriverStartupContext {
+                file: None,
+                guest_tls: None,
+                network_trust: None,
+                network_trust_configured: false,
+                gateway_port: 8080,
+                gateway_tls_enabled: false,
+                endpoint_overrides: &endpoint_overrides,
+            },
+        };
+        let policy = TestComputeDriverFactory.admission_policy(context).unwrap();
+        assert!(policy.resource_admission.enabled);
+        assert_eq!(policy.resource_admission.required_labels.len(), 2);
+        assert!(!policy.allow_driver_config);
+    }
+
+    // Omitting validate_config exercises source compatibility for out-of-tree
+    // factories written before package preflight introduced that hook.
+    #[async_trait::async_trait]
+    impl super::ComputeDriverFactory for TestComputeDriverFactory {
+        async fn build(
+            &self,
+            _context: super::ComputeDriverBuildContext<'_>,
+        ) -> openshell_core::Result<super::ComputeDriverInstance> {
+            unreachable!("selection tests do not construct the driver")
+        }
+    }
+
+    fn test_tls_acceptor() -> (TempDir, TlsAcceptor) {
+        let dir = tempdir().expect("failed to create tempdir");
+        generate_test_certs_with_ca(dir.path());
+
+        let acceptor = TlsAcceptor::from_files(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+            Some(&dir.path().join("ca.pem")),
+            false,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("failed to build tls acceptor");
+
+        (dir, acceptor)
+    }
+
+    async fn test_state(
+        bind_addr: SocketAddr,
+        enable_loopback_service_http: bool,
+    ) -> Arc<ServerState> {
+        let store = Arc::new(
+            crate::persistence::Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .expect("failed to create test store"),
+        );
+        let compute = crate::compute::new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_bind_address(bind_addr)
+                .with_server_sans(["*.dev.openshell.localhost"])
+                .with_loopback_service_http(enable_loopback_service_http)
+                .with_credential_drivers(["test-static"]),
+            store,
+            compute,
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn websocket_tunnel_is_mounted_only_when_enabled() {
+        let state = test_state("127.0.0.1:17670".parse().unwrap(), true).await;
+        let response = super::http_router(state.clone())
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut enabled = state;
+        Arc::get_mut(&mut enabled)
+            .unwrap()
+            .config
+            .enable_websocket_tunnel = true;
+        let response = super::http_router(enabled)
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn start_tls_gateway_listener(
+        bind_addr: &str,
+        enable_loopback_service_http: bool,
+    ) -> (
+        SocketAddr,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+        TempDir,
+    ) {
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .expect("failed to bind test listener");
+        let listen_addr = listener.local_addr().expect("failed to read local addr");
+        let state = test_state(listen_addr, enable_loopback_service_http).await;
+        let service = MultiplexService::new(state);
+        let (tls_dir, tls_acceptor) = test_tls_acceptor();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_gateway_listener(
+            BoundGatewayListener {
+                listener,
+                address: listen_addr,
+            },
+            service,
+            Some(tls_acceptor),
+            enable_loopback_service_http,
+            shutdown_rx,
+        ));
+        (listen_addr, shutdown_tx, handle, tls_dir)
+    }
+
+    async fn start_plaintext_gateway_listener()
+    -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test listener");
+        let listen_addr = listener.local_addr().expect("failed to read local addr");
+        let state = test_state(listen_addr, false).await;
+        let service = MultiplexService::new(state);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_gateway_listener(
+            BoundGatewayListener {
+                listener,
+                address: listen_addr,
+            },
+            service,
+            None,
+            false,
+            shutdown_rx,
+        ));
+        (listen_addr, shutdown_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn production_gateway_listener_serves_reflection() {
+        use tonic_reflection::pb::v1::{
+            ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+        };
+
+        let (addr, shutdown, handle) = start_plaintext_gateway_listener().await;
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+        let request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter([request]))
+            .await
+            .unwrap()
+            .into_inner();
+        let response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ListServicesResponse(services)) = response.message_response
+        else {
+            panic!("expected a reflection list-services response");
+        };
+        assert_eq!(
+            services
+                .service
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect::<Vec<_>>(),
+            ["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+        );
+
+        stop_listener(shutdown, handle).await;
+    }
+
+    async fn send_plain_http(addr: SocketAddr, request: String) -> String {
+        let connect_addr: SocketAddr = format!("127.0.0.1:{}", addr.port())
+            .parse()
+            .expect("failed to build loopback connect addr");
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(connect_addr)
+            .await
+            .expect("failed to connect to test listener");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("failed to write request");
+
+        let mut response = Vec::new();
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("timed out reading response");
+        if let Err(err) = read_result
+            && err.kind() != ErrorKind::ConnectionReset
+        {
+            panic!("failed to read response: {err}");
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn service_request(addr: SocketAddr, extra_headers: &[(&str, &str)]) -> String {
+        let mut request = format!(
+            "GET / HTTP/1.1\r\nHost: default--my-sandbox--web.dev.openshell.localhost:{}\r\nConnection: close\r\n",
+            addr.port()
+        );
+        for (name, value) in extra_headers {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        request
+    }
+
+    async fn stop_listener(shutdown: watch::Sender<bool>, handle: tokio::task::JoinHandle<()>) {
+        let _ = shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[derive(Clone)]
+    struct TraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metrics_tls_handshake_rejection_logs_actionable_context() {
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_mins(1));
+
+        log_metrics_tls_handshake_rejection(
+            &limiter,
+            &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
+            "192.0.2.10:443".parse().expect("valid test client address"),
+        );
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(output.contains("WARN"), "log output: {output}");
+        assert!(
+            output.contains("metrics_tls_handshake_rejected"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("untrusted client certificate"),
+            "log output: {output}"
+        );
+        assert!(output.contains("192.0.2.10:443"), "log output: {output}");
+        assert!(
+            output.contains("Rejected metrics TLS handshake"),
+            "log output: {output}"
+        );
+    }
+
+    #[test]
+    fn metrics_tls_handshake_warnings_are_rate_limited() {
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_mins(1));
+        let start = Instant::now();
+
+        assert_eq!(limiter.record(start), Some(0));
+        assert_eq!(limiter.record(start + Duration::from_secs(1)), None);
+        assert_eq!(limiter.record(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            limiter.record(start + Duration::from_mins(1)),
+            Some(2),
+            "the next warning reports the rejected handshakes suppressed during the interval"
+        );
+    }
+
+    #[test]
+    fn metrics_tls_handshake_timeout_warns_independently_of_rejections() {
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let limiters = MetricsTlsHandshakeLogLimiters::new(Duration::from_mins(1));
+        let client = "192.0.2.10:443".parse().expect("valid test client address");
+
+        // A rejected handshake warns once and suppresses further rejections
+        // for the interval; a timeout during that window must still warn with
+        // its own message and counts instead of being absorbed by the
+        // rejection limiter.
+        log_metrics_tls_handshake_rejection(
+            &limiters.rejections,
+            &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
+            client,
+        );
+        log_metrics_tls_handshake_timeout(&limiters.timeouts, client);
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            output.contains("metrics_tls_handshake_rejected"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("Metrics TLS handshakes timed out"),
+            "the timeout still warns after a rejected handshake: {output}"
+        );
+        assert!(
+            output.matches("WARN").count() >= 2,
+            "both the rejection and the timeout warn: {output}"
+        );
+    }
+
+    #[test]
+    fn invalid_metrics_tls_material_disables_only_the_metrics_listener() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let tls = MetricsTlsConfig {
+            cert_path: PathBuf::from("/tmp/openshell-missing-metrics-cert.pem"),
+            key_path: PathBuf::from("/tmp/openshell-missing-metrics-key.pem"),
+            client_ca_path: None,
+            require_client_auth: false,
+        };
+
+        assert!(
+            metrics_tls_acceptor_or_disable(&tls).is_none(),
+            "invalid metrics TLS files must not produce a plaintext listener or abort startup"
+        );
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            output.contains("metrics_tls_listener_disabled"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("listener=\"metrics\""),
+            "log output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_metrics_listener_serves_https_and_rejects_plaintext() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind metrics listener");
+        let address = listener
+            .local_addr()
+            .expect("failed to read metrics listener address");
+        let (tls_dir, tls_acceptor) = test_tls_acceptor();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(serve_tls_metrics_listener(
+            listener,
+            Router::new().route("/metrics", get(|| async { "metrics" })),
+            tls_acceptor,
+            shutdown_rx,
+        ));
+
+        let connector = test_tls_connector(&tls_dir.path().join("ca.pem"), None);
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect to metrics listener");
+        let mut tls_stream = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+            .expect("metrics TLS handshake failed");
+        tls_stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to request metrics over TLS");
+        let mut response = Vec::new();
+        tls_stream
+            .read_to_end(&mut response)
+            .await
+            .expect("failed to read metrics TLS response");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "expected a successful HTTPS metrics response"
+        );
+
+        let mut plaintext = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect for plaintext request");
+        plaintext
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to write plaintext metrics request");
+        let mut plaintext_response = Vec::new();
+        let plaintext_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            plaintext.read_to_end(&mut plaintext_response),
+        )
+        .await
+        .expect("timed out waiting for plaintext metrics connection to close");
+        if let Err(error) = plaintext_result {
+            assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+        }
+        assert!(
+            !String::from_utf8_lossy(&plaintext_response).starts_with("HTTP/"),
+            "TLS metrics listener must not serve plaintext HTTP"
+        );
+
+        stop_listener(shutdown_tx, listener_task).await;
+    }
+
+    #[tokio::test]
+    async fn metrics_mtls_trusts_only_the_metrics_client_ca() {
+        let directory = tempdir().expect("failed to create test directory");
+        let (_server_ca_cert, _server_ca_key) = generate_test_certs_with_ca(directory.path());
+
+        let metrics_ca_directory = directory.path().join("metrics-client-ca");
+        fs::create_dir(&metrics_ca_directory).expect("failed to create metrics CA directory");
+        let (metrics_ca_cert, metrics_ca_key) = generate_test_certs_with_ca(&metrics_ca_directory);
+
+        let gateway_ca_directory = directory.path().join("gateway-client-ca");
+        fs::create_dir(&gateway_ca_directory).expect("failed to create gateway CA directory");
+        let (gateway_ca_cert, gateway_ca_key) = generate_test_certs_with_ca(&gateway_ca_directory);
+
+        let (metrics_client_cert, metrics_client_key) = write_test_client_certificate(
+            directory.path(),
+            "metrics-client",
+            &metrics_ca_cert,
+            &metrics_ca_key,
+        );
+        let (gateway_client_cert, gateway_client_key) = write_test_client_certificate(
+            directory.path(),
+            "gateway-client",
+            &gateway_ca_cert,
+            &gateway_ca_key,
+        );
+        let metrics_tls_acceptor = TlsAcceptor::from_files(
+            &directory.path().join("server-cert.pem"),
+            &directory.path().join("server-key.pem"),
+            Some(&metrics_ca_directory.join("ca.pem")),
+            true,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("failed to configure metrics mTLS acceptor");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind metrics listener");
+        let address = listener
+            .local_addr()
+            .expect("failed to read metrics listener address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener_task = tokio::spawn(serve_tls_metrics_listener(
+            listener,
+            Router::new().route("/metrics", get(|| async { "metrics" })),
+            metrics_tls_acceptor,
+            shutdown_rx,
+        ));
+
+        let metrics_connector = test_tls_connector(
+            &directory.path().join("ca.pem"),
+            Some((&metrics_client_cert, &metrics_client_key)),
+        );
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect with metrics client certificate");
+        let mut metrics_client = metrics_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+            .expect("metrics client TLS handshake failed");
+        metrics_client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("failed to request metrics with metrics client certificate");
+        let mut authorized_response = Vec::new();
+        metrics_client
+            .read_to_end(&mut authorized_response)
+            .await
+            .expect("failed to read authorized metrics response");
+        assert!(
+            String::from_utf8_lossy(&authorized_response).starts_with("HTTP/1.1 200"),
+            "metrics client certificate should be authorized"
+        );
+
+        let gateway_connector = test_tls_connector(
+            &directory.path().join("ca.pem"),
+            Some((&gateway_client_cert, &gateway_client_key)),
+        );
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect with gateway client certificate");
+        let rejected_response = match gateway_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+        {
+            Ok(mut gateway_client) => {
+                let _ = gateway_client
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    gateway_client.read_to_end(&mut response),
+                )
+                .await;
+                response
+            }
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            !String::from_utf8_lossy(&rejected_response).starts_with("HTTP/"),
+            "gateway client certificate must not authorize metrics scraping"
+        );
+
+        let anonymous_connector = test_tls_connector(&directory.path().join("ca.pem"), None);
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .expect("failed to connect without a client certificate");
+        let anonymous_response = match anonymous_connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost")
+                    .expect("invalid test server name")
+                    .to_owned(),
+                stream,
+            )
+            .await
+        {
+            Ok(mut anonymous_client) => {
+                let _ = anonymous_client
+                    .write_all(
+                        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let mut response = Vec::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    anonymous_client.read_to_end(&mut response),
+                )
+                .await;
+                response
+            }
+            Err(_) => Vec::new(),
+        };
+        assert!(
+            !String::from_utf8_lossy(&anonymous_response).starts_with("HTTP/"),
+            "metrics mTLS must reject clients without a certificate"
+        );
+
+        stop_listener(shutdown_tx, listener_task).await;
+    }
+
+    #[test]
+    fn classifies_probe_style_tls_disconnects_as_benign() {
+        for kind in [ErrorKind::UnexpectedEof, ErrorKind::ConnectionReset] {
+            let error = Error::new(kind, "probe disconnected");
+            assert!(is_benign_tls_handshake_failure(&error));
+        }
+    }
+
+    #[test]
+    fn preserves_real_tls_failures_as_errors() {
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            let error = Error::new(kind, "real tls failure");
+            assert!(!is_benign_tls_handshake_failure(&error));
+        }
+    }
+
+    #[test]
+    fn classifies_tls_and_plain_http_prefaces() {
+        assert_eq!(
+            classify_initial_bytes(&[0x16, 0x03, 0x01, 0x00]),
+            ConnectionProtocol::Tls
+        );
+        assert_eq!(
+            classify_initial_bytes(b"GET / HTTP/1.1\r\n"),
+            ConnectionProtocol::PlainHttp
+        );
+        assert_eq!(classify_initial_bytes(b"G"), ConnectionProtocol::PlainHttp);
+        assert_eq!(
+            classify_initial_bytes(b"\x00\x01\x02"),
+            ConnectionProtocol::Unknown
+        );
+    }
+
+    #[test]
+    fn plaintext_service_http_requires_loopback_listener_and_peer() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
+        assert!(allow_plaintext_service_http(true, loopback, peer));
+        assert!(!allow_plaintext_service_http(false, loopback, peer));
+        assert!(!allow_plaintext_service_http(true, wildcard, peer));
+        assert!(!allow_plaintext_service_http(true, loopback, remote_peer));
+    }
+
+    #[tokio::test]
+    async fn plaintext_service_http_listener_rejects_non_loopback_bind() {
+        let (addr, shutdown, handle, _tls_dir) =
+            start_tls_gateway_listener("0.0.0.0:0", true).await;
+
+        let response = send_plain_http(addr, service_request(addr, &[])).await;
+
+        assert!(
+            response.is_empty(),
+            "non-loopback gateway listener should drop plaintext service HTTP, got: {response:?}"
+        );
+        stop_listener(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn plaintext_service_http_rejects_cross_origin_browser_contexts() {
+        let (addr, shutdown, handle, _tls_dir) =
+            start_tls_gateway_listener("127.0.0.1:0", true).await;
+        let cases = [
+            (
+                "cross-site fetch metadata",
+                vec![("Sec-Fetch-Site", "cross-site")],
+            ),
+            (
+                "same-site sibling fetch metadata",
+                vec![("Sec-Fetch-Site", "same-site")],
+            ),
+            (
+                "mismatched origin",
+                vec![(
+                    "Origin",
+                    "http://other-sandbox--web.dev.openshell.localhost:8080",
+                )],
+            ),
+            (
+                "mismatched referer",
+                vec![(
+                    "Referer",
+                    "http://other-sandbox--web.dev.openshell.localhost:8080/page",
+                )],
+            ),
+        ];
+
+        for (name, headers) in cases {
+            let response = send_plain_http(addr, service_request(addr, &headers)).await;
+
+            assert!(
+                response.starts_with("HTTP/1.1 403 Forbidden"),
+                "{name} should be rejected before service lookup, got: {response:?}"
+            );
+            assert!(
+                response.contains("Cross-origin service request rejected"),
+                "{name} should explain the service rejection, got: {response:?}"
+            );
+        }
+        stop_listener(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn plaintext_service_http_allows_same_origin_browser_context_to_reach_service_lookup() {
+        let (addr, shutdown, handle, _tls_dir) =
+            start_tls_gateway_listener("127.0.0.1:0", true).await;
+        let origin = format!(
+            "http://default--my-sandbox--web.dev.openshell.localhost:{}",
+            addr.port()
+        );
+        let response = send_plain_http(
+            addr,
+            service_request(
+                addr,
+                &[("Sec-Fetch-Site", "same-origin"), ("Origin", &origin)],
+            ),
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found"),
+            "same-origin browser context should pass CSRF guard and miss only because no endpoint exists, got: {response:?}"
+        );
+        assert!(
+            !response.contains("Cross-origin service request rejected"),
+            "same-origin browser context should not be rejected as cross-origin, got: {response:?}"
+        );
+        stop_listener(shutdown, handle).await;
+    }
+
+    #[tokio::test]
+    async fn plaintext_service_http_does_not_expose_grpc_gateway() {
+        let (addr, shutdown, handle, _tls_dir) =
+            start_tls_gateway_listener("127.0.0.1:0", true).await;
+        let grpc_endpoint = format!("http://127.0.0.1:{}", addr.port());
+        let grpc_succeeded = tokio::time::timeout(Duration::from_secs(2), async {
+            match OpenShellClient::connect(grpc_endpoint).await {
+                Ok(mut client) => client.health(HealthRequest {}).await.is_ok(),
+                Err(_) => false,
+            }
+        })
+        .await
+        .expect("timed out checking plaintext gRPC exposure");
+
+        assert!(
+            !grpc_succeeded,
+            "plaintext service HTTP must not expose successful gateway gRPC"
+        );
+
+        let request = format!(
+            "POST /openshell.v1.OpenShell/Health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/grpc\r\nTE: trailers\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            addr.port()
+        );
+
+        let response = send_plain_http(addr, request).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found"),
+            "plaintext service HTTP router should not serve gateway gRPC, got: {response:?}"
+        );
+        assert!(
+            !response.contains("grpc-status: 0"),
+            "plaintext service HTTP must not return a successful gRPC response: {response:?}"
+        );
+        stop_listener(shutdown, handle).await;
+    }
+
+    #[test]
+    fn configured_compute_driver_triggers_auto_detection_when_empty() {
+        fn available() -> bool {
+            true
+        }
+
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new(
+                    "detected",
+                    100,
+                    Some(available),
+                    TestComputeDriverFactory,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let config = Config::new(None);
+        let result =
+            configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
+                .unwrap();
+
+        let ConfiguredComputeDriver::Registered(registration) = result else {
+            panic!("auto-detection must select a registered driver");
+        };
+        assert_eq!(registration.name, "detected");
+    }
+
+    #[test]
+    fn registry_detection_reports_available_drivers_in_priority_order() {
+        DETECTION_PROBE_ORDER.lock().unwrap().clear();
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new(
+                    "third",
+                    300,
+                    Some(available_third_probe),
+                    TestComputeDriverFactory,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new(
+                    "first",
+                    100,
+                    Some(unavailable_first_probe),
+                    TestComputeDriverFactory,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new(
+                    "second",
+                    200,
+                    Some(available_second_probe),
+                    TestComputeDriverFactory,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let detection = registry.detect();
+        assert_eq!(detection.selected(), Some("second"));
+        assert_eq!(
+            detection
+                .available
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["second", "third"]
+        );
+        assert_eq!(
+            DETECTION_PROBE_ORDER.lock().unwrap().as_slice(),
+            ["first", "second", "third"]
+        );
+        assert_eq!(
+            registry.installed_driver_names().collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_accepts_registered_name() {
+        let config = Config::new(None).with_compute_driver("beta");
+        let registry = test_compute_drivers();
+        let driver =
+            configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
+                .unwrap();
+        assert_eq!(
+            driver.telemetry_compute_driver(&registry).as_str(),
+            "registered"
+        );
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Registered(registration) if registration.name == "beta"
+        ));
+    }
+
+    #[test]
+    fn configured_compute_driver_resolves_named_remote() {
+        let config = Config::new(None).with_compute_driver("kyma");
+        let registry = test_compute_drivers();
+
+        let driver =
+            configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
+                .unwrap();
+        assert_eq!(
+            driver.telemetry_compute_driver(&registry).as_str(),
+            "custom"
+        );
+
+        match driver {
+            ConfiguredComputeDriver::Remote { name } => {
+                assert_eq!(name, "kyma");
+            }
+            ConfiguredComputeDriver::Registered(other) => {
+                panic!(
+                    "expected remote driver, got registered driver {}",
+                    other.name
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn configured_compute_driver_uses_endpoint_override() {
+        let config = Config::new(None)
+            .with_compute_driver("alpha")
+            .with_compute_driver_endpoint("alpha", "/run/openshell/alpha.sock");
+        let registry = test_compute_drivers();
+
+        let driver =
+            configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
+                .unwrap();
+        assert_eq!(
+            driver.telemetry_compute_driver(&registry).as_str(),
+            "registered"
+        );
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Remote { name } if name == "alpha"
+        ));
+    }
+
+    #[test]
+    fn configured_compute_driver_uses_builtin_endpoint_override() {
+        let config = Config::new(None)
+            .with_compute_driver("beta")
+            .with_compute_driver_endpoint("beta", "/run/openshell/beta.sock");
+
+        let driver = configured_compute_driver(
+            &test_compute_drivers(),
+            &config,
+            test_driver_startup(&config, None),
+        )
+        .unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Remote { name } if name == "beta"
+        ));
+    }
+
+    #[test]
+    fn network_trust_is_available_to_startup_context() {
+        let config = Config::new(None).with_compute_driver("docker");
+        let bundle = test_network_trust_bundle();
+        let startup = test_driver_startup_with_bundle(&config, None, Some(&bundle));
+
+        assert_eq!(
+            startup
+                .network_trust
+                .expect("configured trust bundle")
+                .certificate_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_endpoint_override_before_remote_connection() {
+        let config = Config::new(None)
+            .with_compute_driver("docker")
+            .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &test_compute_drivers(),
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("destination trust must not be discarded by a remote override");
+
+        assert!(error.to_string().contains("additional_ca_bundle"));
+        assert!(error.to_string().contains("unsupported"));
+        assert!(!error.to_string().contains("docker.sock"));
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_unknown_remote_driver() {
+        let config = Config::new(None).with_compute_driver("kyma");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &test_compute_drivers(),
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("destination trust must not be silently ignored by a remote driver");
+
+        assert!(error.to_string().contains("additional_ca_bundle"));
+        assert!(error.to_string().contains("kyma"));
+    }
+
+    #[test]
+    fn configured_network_trust_rejects_unsupported_custom_registration() {
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new("custom", 1, None, TestComputeDriverFactory)
+                    .expect("custom registration"),
+            )
+            .expect("install custom registration");
+        let config = Config::new(None).with_compute_driver("custom");
+        let bundle = test_network_trust_bundle();
+        let error = configured_compute_driver(
+            &registry,
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect_err("custom drivers cannot consume the shared trust contract yet");
+
+        assert!(error.to_string().contains("additional_ca_bundle"));
+        assert!(error.to_string().contains("custom"));
+        assert!(error.to_string().contains("network trust propagation"));
+    }
+
+    #[derive(Clone, Copy)]
+    struct TrustPropagatingTestFactory;
+
+    #[async_trait::async_trait]
+    impl super::ComputeDriverFactory for TrustPropagatingTestFactory {
+        fn supports_network_supervisor_trust(&self) -> bool {
+            true
+        }
+
+        async fn build(
+            &self,
+            _context: super::ComputeDriverBuildContext<'_>,
+        ) -> openshell_core::Result<super::ComputeDriverInstance> {
+            unreachable!("selection tests do not construct the driver")
+        }
+    }
+
+    #[test]
+    fn configured_network_trust_accepts_explicitly_capable_registration() {
+        let mut registry = super::ComputeDriverRegistry::new();
+        registry
+            .install(
+                super::ComputeDriverRegistration::new(
+                    "custom",
+                    1,
+                    None,
+                    TrustPropagatingTestFactory,
+                )
+                .expect("custom registration"),
+            )
+            .expect("install custom registration");
+        let config = Config::new(None).with_compute_driver("custom");
+        let bundle = test_network_trust_bundle();
+
+        let driver = configured_compute_driver(
+            &registry,
+            &config,
+            test_driver_startup_with_bundle(&config, None, Some(&bundle)),
+        )
+        .expect("an explicitly capable registration accepts destination trust");
+        assert!(matches!(driver, ConfiguredComputeDriver::Registered(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_gateway_listener_bind_does_not_attempt_persisted_sandbox_start() {
+        let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_address = occupied_listener.local_addr().unwrap();
+        let start_attempted = AtomicBool::new(false);
+        let result: openshell_core::Result<()> = async {
+            let _listener = bind_gateway_listener(occupied_address).await?;
+            start_attempted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        .await;
+
+        assert!(
+            result.is_err(),
+            "binding the occupied gateway address should fail"
+        );
+        assert!(
+            !start_attempted.load(Ordering::SeqCst),
+            "persisted sandbox start must not run before the gateway listener is bound"
+        );
+    }
+
+    /// A loopback address where nothing listens until a test binds it.
+    async fn reserved_loopback_address() -> SocketAddr {
+        TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a loopback port")
+            .local_addr()
+            .expect("loopback address")
+    }
+
+    /// Status code of `GET path`, or `None` when nothing answers.
+    async fn http_status(address: SocketAddr, path: &str) -> Option<u16> {
+        let mut stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .ok()?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.ok()?;
+        response.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    async fn wait_for_http_status(address: SocketAddr, path: &str, expected: u16) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while http_status(address, path).await != Some(expected) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{path} never returned {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_store_serves_probes_while_the_database_is_unreachable() {
+        let url = crate::persistence::PostgresStore::refusing_url_for_tests().await;
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let shutdown = async {
+            let _ = stopped.await;
+        };
+        tokio::pin!(shutdown);
+        let config = Config::new(None);
+
+        let probe = async {
+            wait_for_http_status(health_address, "/healthz", 200).await;
+            assert_eq!(http_status(health_address, "/readyz").await, Some(503));
+            stop.send(()).expect("connect_store is still waiting");
+        };
+        let (result, ()) = tokio::join!(
+            super::connect_store(&config, &url, &mut health, shutdown.as_mut()),
+            probe
+        );
+
+        assert!(
+            result.expect("shutdown is not an error").is_none(),
+            "shutdown ends the wait without a store"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_store_returns_a_configuration_error_without_retrying() {
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let shutdown = std::future::pending::<()>();
+        tokio::pin!(shutdown);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::connect_store(
+                &Config::new(None),
+                "postgres://openshell@127.0.0.1:1/openshell?sslmode=invalid",
+                &mut health,
+                shutdown.as_mut(),
+            ),
+        )
+        .await
+        .expect("a configuration error is not retried");
+
+        assert!(result.is_err());
+        assert_eq!(http_status(health_address, "/healthz").await, None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_connect_store_retries_until_the_database_answers() {
+        let schema = crate::persistence::test_postgres::TestSchema::create("startup").await;
+        let upstream = url::Url::parse(schema.url()).expect("parse the PostgreSQL URL");
+        let upstream_addresses: Vec<SocketAddr> = tokio::net::lookup_host((
+            upstream.host_str().expect("TCP PostgreSQL host"),
+            upstream.port().unwrap_or(5432),
+        ))
+        .await
+        .expect("resolve PostgreSQL")
+        .collect();
+        let late_address = reserved_loopback_address().await;
+        let mut url = upstream.clone();
+        url.set_host(Some("127.0.0.1")).expect("set host");
+        url.set_port(Some(late_address.port())).expect("set port");
+        let health_address = reserved_loopback_address().await;
+        let mut health = super::HealthListener::new(Some(health_address));
+        let shutdown = std::future::pending::<()>();
+        tokio::pin!(shutdown);
+        let config = Config::new(None);
+
+        // PostgreSQL becomes reachable only after the gateway reports that it
+        // is waiting.
+        let late_database = async {
+            wait_for_http_status(health_address, "/healthz", 200).await;
+            assert_eq!(http_status(health_address, "/readyz").await, Some(503));
+            let listener = TcpListener::bind(late_address)
+                .await
+                .expect("bind the late PostgreSQL address");
+            loop {
+                let (mut client, _) = listener.accept().await.expect("accept");
+                openshell_core::net::set_tcp_nodelay_best_effort(&client);
+                let mut upstream = openshell_core::net::connect_tcp_nodelay_best_effort(
+                    upstream_addresses.as_slice(),
+                )
+                .await
+                .expect("connect to PostgreSQL");
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        };
+        let store = tokio::select! {
+            result = tokio::time::timeout(
+                Duration::from_mins(1),
+                super::connect_store(&config, url.as_str(), &mut health, shutdown.as_mut()),
+            ) => result
+                .expect("connect_store finishes once PostgreSQL answers")
+                .expect("connect")
+                .expect("no shutdown"),
+            () = late_database => unreachable!("the forwarder runs until the store connects"),
+        };
+        store.ping().await.expect("ping the connected store");
+
+        health
+            .serve(Arc::new(store))
+            .await
+            .expect("keep serving the bound health listener");
+        wait_for_http_status(health_address, "/readyz", 200).await;
+
+        schema.drop_schema().await;
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

@@ -1,0 +1,2510 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Browser-facing HTTP routing for sandbox service endpoints.
+
+use axum::{
+    body::Body,
+    response::{IntoResponse, Response as AxumResponse},
+};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
+use hyper_util::rt::TokioIo;
+use openshell_core::config::ServiceRoutingConfig;
+use openshell_core::proto::{
+    Sandbox, SandboxPhase, ServiceAuthorizationMode, ServiceEndpoint, TcpRelayTarget, relay_open,
+};
+use openshell_core::{ObjectId, ObjectWorkspace};
+use openshell_ocsf::{
+    ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
+    HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
+    OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
+};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tracing::warn;
+
+use crate::ServerState;
+use crate::persistence::{ObjectListQuery, ObjectType, Store};
+
+const ENDPOINT_OBJECT_TYPE: &str = "service_endpoint";
+const ROUTING_RULE_NAME: &str = "sandbox_service_routing";
+const ROUTING_RULE_TYPE: &str = "gateway";
+const RELAY_RULE_NAME: &str = "sandbox_service_relay";
+const RELAY_TARGET_HOST: &str = "127.0.0.1";
+/// How long an idle upstream is kept. Deliberately short: a sandbox app can
+/// close its side at any time, and a connection we hand out after it died
+/// fails the request.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Idle upstreams kept per endpoint. Concurrent requests need one each,
+/// because HTTP/1 serves a single request at a time per connection.
+const UPSTREAM_MAX_IDLE_PER_ENDPOINT: usize = 8;
+/// Minimum gap between full sweeps of the pool.
+const UPSTREAM_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+type UpstreamSender = hyper::client::conn::http1::SendRequest<Body>;
+
+struct PooledUpstream {
+    sender: UpstreamSender,
+    idle_since: Instant,
+}
+
+#[derive(Default)]
+struct UpstreamPoolInner {
+    idle: HashMap<String, Vec<PooledUpstream>>,
+    last_sweep: Option<Instant>,
+}
+
+impl UpstreamPoolInner {
+    /// Full sweeps are rate-limited so a large pool can't turn every insert
+    /// into a scan of every endpoint.
+    fn sweep_if_due(&mut self, now: Instant) {
+        if let Some(last) = self.last_sweep
+            && now.duration_since(last) < UPSTREAM_SWEEP_INTERVAL
+        {
+            return;
+        }
+        self.last_sweep = Some(now);
+        self.idle.retain(|_, entries| {
+            entries.retain(|entry| is_reusable(entry, now));
+            !entries.is_empty()
+        });
+    }
+}
+
+/// Idle upstream connections to sandbox services, keyed by endpoint.
+///
+/// Without this every HTTP request opened its own supervisor relay, which
+/// meant a new TCP connection inside the sandbox and a new HTTP/1 handshake
+/// per request, and counted against the 32 in-flight relay cap per sandbox.
+#[derive(Default)]
+pub struct ServiceUpstreamPool {
+    inner: Mutex<UpstreamPoolInner>,
+}
+
+impl std::fmt::Debug for ServiceUpstreamPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceUpstreamPool")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceUpstreamPool {
+    /// Takes an upstream that is connected and free.
+    ///
+    /// `is_ready` is what makes reuse safe: HTTP/1 can't start a request until
+    /// the previous response body has been read, and hyper only reports ready
+    /// once that has happened.
+    fn take(&self, key: &str) -> Option<UpstreamSender> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        let entries = inner.idle.get_mut(key)?;
+        entries.retain(|entry| is_reusable(entry, now));
+        let taken = entries
+            .iter()
+            .position(|entry| entry.sender.is_ready())
+            .map(|index| entries.swap_remove(index).sender);
+        if entries.is_empty() {
+            inner.idle.remove(key);
+        }
+        taken
+    }
+
+    fn put(&self, key: &str, sender: UpstreamSender) {
+        if sender.is_closed() {
+            return;
+        }
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner.sweep_if_due(now);
+        let entries = inner.idle.entry(key.to_string()).or_default();
+        if entries.len() >= UPSTREAM_MAX_IDLE_PER_ENDPOINT {
+            return;
+        }
+        entries.push(PooledUpstream {
+            sender,
+            idle_since: now,
+        });
+    }
+
+    fn evict(&self, key: &str) {
+        self.inner.lock().unwrap().idle.remove(key);
+    }
+}
+
+fn is_reusable(entry: &PooledUpstream, now: Instant) -> bool {
+    !entry.sender.is_closed() && now.duration_since(entry.idle_since) <= UPSTREAM_IDLE_TIMEOUT
+}
+
+fn upstream_pool_key(endpoint_id: &str, target_port: u16) -> String {
+    format!("{endpoint_id}|{target_port}")
+}
+
+impl ObjectType for ServiceEndpoint {
+    fn object_type() -> &'static str {
+        ENDPOINT_OBJECT_TYPE
+    }
+}
+
+pub fn endpoint_key(sandbox: &str, service: &str) -> String {
+    if service.is_empty() {
+        sandbox.to_string()
+    } else {
+        format!("{sandbox}--{service}")
+    }
+}
+
+pub fn endpoint_url(
+    config: &openshell_core::Config,
+    workspace: &str,
+    sandbox: &str,
+    service: &str,
+) -> Option<String> {
+    let host = endpoint_host(
+        config.service_routing_discriminator(),
+        &config.service_routing,
+        workspace,
+        sandbox,
+        service,
+    )?;
+    let scheme = endpoint_scheme(config);
+    let port = config.bind_address.port();
+    let include_port = !matches!((scheme, port), ("https", 443) | ("http", 80));
+    Some(if include_port {
+        format!("{scheme}://{host}:{port}/")
+    } else {
+        format!("{scheme}://{host}/")
+    })
+}
+
+fn endpoint_scheme(config: &openshell_core::Config) -> &'static str {
+    if config.tls.is_none()
+        || (config.bind_address.ip().is_loopback()
+            && config.service_routing.enable_loopback_service_http)
+    {
+        "http"
+    } else {
+        "https"
+    }
+}
+
+fn endpoint_host(
+    discriminator: Option<&str>,
+    config: &ServiceRoutingConfig,
+    workspace: &str,
+    sandbox: &str,
+    service: &str,
+) -> Option<String> {
+    let base_domain = config.base_domains.first()?;
+    Some(discriminator.map_or_else(
+        || {
+            if service.is_empty() {
+                format!("{workspace}--{sandbox}.{base_domain}")
+            } else {
+                format!("{workspace}--{sandbox}--{service}.{base_domain}")
+            }
+        },
+        |gateway_name| {
+            format!(
+                "{}.{}",
+                service_route_hash_label(
+                    gateway_name,
+                    workspace,
+                    sandbox,
+                    (!service.is_empty()).then_some(service),
+                ),
+                base_domain
+            )
+        },
+    ))
+}
+
+/// Returns the stable, one-label DNS name for a service route.
+pub fn service_route_hash_label(
+    gateway_name: &str,
+    workspace: &str,
+    sandbox: &str,
+    service: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(gateway_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(workspace.as_bytes());
+    hasher.update([0]);
+    hasher.update(sandbox.as_bytes());
+    hasher.update([0]);
+    hasher.update(service.unwrap_or("").as_bytes());
+    let digest = hasher.finalize();
+    base32_lower_no_padding(&digest[..10])
+}
+
+fn base32_lower_no_padding(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut output = String::with_capacity(16);
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u8;
+    for byte in bytes {
+        accumulator = (accumulator << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            output.push(char::from(
+                ALPHABET[((accumulator >> bits) & 0x1f) as usize],
+            ));
+        }
+    }
+    if bits > 0 {
+        output.push(char::from(
+            ALPHABET[((accumulator << (5 - bits)) & 0x1f) as usize],
+        ));
+    }
+    output
+}
+
+/// A resolved service-route destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRouteTarget {
+    pub workspace: String,
+    pub sandbox: String,
+    pub service: Option<String>,
+}
+
+impl ServiceRouteTarget {
+    fn new(workspace: &str, sandbox: &str, service: &str) -> Self {
+        Self {
+            workspace: workspace.to_string(),
+            sandbox: sandbox.to_string(),
+            service: (!service.is_empty()).then(|| service.to_string()),
+        }
+    }
+}
+
+/// A collision between two service routes with the same hashed hostname.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CollisionError {
+    label: String,
+}
+
+impl std::fmt::Display for CollisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "service routing hostname hash collision for {}",
+            self.label
+        )
+    }
+}
+
+impl std::error::Error for CollisionError {}
+
+/// Debounce window for miss-triggered index rebuilds on the request path.
+///
+/// A miss-triggered rebuild scans every persisted service endpoint across all
+/// workspaces, and misses happen before authentication: without a debounce,
+/// a stream of unauthenticated requests carrying random well-formed hash
+/// labels would amplify into a full store scan per request. With the
+/// debounce, the worst case is one scan per window.
+pub const SERVICE_ROUTE_REBUILD_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// In-memory lookup table for opaque service-routing host labels.
+#[derive(Debug)]
+pub struct ServiceRouteIndex {
+    gateway_name: Option<String>,
+    entries: Arc<RwLock<HashMap<String, ServiceRouteTarget>>>,
+    /// Timestamp of the last rebuild attempt, gating miss-triggered
+    /// rebuilds. `None` means the index has never been rebuilt and the
+    /// first miss may trigger one immediately.
+    last_rebuild: RwLock<Option<Instant>>,
+    rebuild_debounce: Duration,
+}
+
+impl ServiceRouteIndex {
+    pub fn new(gateway_name: Option<String>) -> Self {
+        Self {
+            gateway_name,
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            last_rebuild: RwLock::new(None),
+            rebuild_debounce: SERVICE_ROUTE_REBUILD_DEBOUNCE,
+        }
+    }
+
+    /// Override the miss-triggered rebuild debounce (tests only).
+    pub fn set_rebuild_debounce(&mut self, debounce: Duration) {
+        self.rebuild_debounce = debounce;
+    }
+
+    fn route_label(&self, target: &ServiceRouteTarget) -> Option<String> {
+        self.gateway_name.as_deref().map(|gateway_name| {
+            service_route_hash_label(
+                gateway_name,
+                &target.workspace,
+                &target.sandbox,
+                target.service.as_deref(),
+            )
+        })
+    }
+
+    pub fn register(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        service: &str,
+    ) -> Result<(), CollisionError> {
+        self.reserve(workspace, sandbox, service).map(|_| ())
+    }
+
+    /// Reserves a route and returns whether this call inserted it.
+    pub(crate) fn reserve(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        service: &str,
+    ) -> Result<bool, CollisionError> {
+        let target = ServiceRouteTarget::new(workspace, sandbox, service);
+        let Some(label) = self.route_label(&target) else {
+            return Ok(false);
+        };
+        let mut entries = self.entries.write().unwrap();
+        if let Some(existing) = entries.get(&label) {
+            return if existing == &target {
+                Ok(false)
+            } else {
+                Err(CollisionError { label })
+            };
+        }
+        entries.insert(label, target);
+        Ok(true)
+    }
+
+    pub fn remove(&self, workspace: &str, sandbox: &str, service: &str) {
+        let target = ServiceRouteTarget::new(workspace, sandbox, service);
+        let Some(label) = self.route_label(&target) else {
+            return;
+        };
+        let mut entries = self.entries.write().unwrap();
+        if entries.get(&label) == Some(&target) {
+            entries.remove(&label);
+        }
+    }
+
+    pub fn lookup(&self, label: &str) -> Option<ServiceRouteTarget> {
+        self.entries.read().unwrap().get(label).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(&self, label: String, target: ServiceRouteTarget) {
+        self.entries.write().unwrap().insert(label, target);
+    }
+
+    /// Rebuild from durable state unconditionally. Startup hydration and
+    /// explicit refresh paths use this; the request path uses
+    /// [`Self::rebuild_if_stale`].
+    pub async fn rebuild(&self, store: &Store) -> Result<(), CollisionError> {
+        *self.last_rebuild.write().unwrap() = Some(Instant::now());
+        self.rebuild_inner(store).await
+    }
+
+    /// Rebuild from durable state only when the previous rebuild attempt is
+    /// older than the debounce window. Returns `Ok(false)` when the rebuild
+    /// was skipped. The timestamp is stamped on the attempt, so a failing
+    /// store cannot be retried more than once per window either.
+    pub async fn rebuild_if_stale(&self, store: &Store) -> Result<bool, CollisionError> {
+        {
+            let mut last = self.last_rebuild.write().unwrap();
+            if last.is_some_and(|at| at.elapsed() < self.rebuild_debounce) {
+                return Ok(false);
+            }
+            *last = Some(Instant::now());
+        }
+        self.rebuild_inner(store).await.map(|()| true)
+    }
+
+    async fn rebuild_inner(&self, store: &Store) -> Result<(), CollisionError> {
+        let Some(gateway_name) = self.gateway_name.as_deref() else {
+            return Ok(());
+        };
+        let endpoints = store
+            .collect_messages::<ServiceEndpoint>(ObjectListQuery::AllWorkspaces)
+            .await
+            .map_err(|error| {
+                warn!(error = %error, "failed to rebuild service routing index");
+                CollisionError {
+                    label: "persistence error".to_string(),
+                }
+            })?;
+        let mut rebuilt = HashMap::new();
+        for endpoint in endpoints {
+            let target = ServiceRouteTarget::new(
+                endpoint.object_workspace(),
+                &endpoint.sandbox,
+                &endpoint.name,
+            );
+            let label = service_route_hash_label(
+                gateway_name,
+                &target.workspace,
+                &target.sandbox,
+                target.service.as_deref(),
+            );
+            if let Some(existing) = rebuilt.get(&label)
+                && existing != &target
+            {
+                return Err(CollisionError { label });
+            }
+            rebuilt.insert(label, target);
+        }
+        *self.entries.write().unwrap() = rebuilt;
+        Ok(())
+    }
+}
+
+// The `--` delimiter is unambiguous because both workspace and sandbox name
+// validation reject consecutive hyphens (see `validate_workspace_name` and
+// `validate_sandbox_spec`).
+pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, String, String)> {
+    let host = host.split_once(':').map_or(host, |(name, _)| name);
+    for base_domain in &config.base_domains {
+        let expected_suffix = format!(".{base_domain}");
+        let Some(encoded) = host.strip_suffix(&expected_suffix) else {
+            continue;
+        };
+        let (workspace, rest) = encoded.split_once("--")?;
+        if workspace.is_empty() || workspace.contains("--") {
+            return None;
+        }
+        let (sandbox, service) = if let Some((sandbox, service)) = rest.split_once("--") {
+            if service.is_empty() || service.contains("--") {
+                return None;
+            }
+            (sandbox, service)
+        } else {
+            (rest, "")
+        };
+        if sandbox.is_empty() || sandbox.contains("--") {
+            return None;
+        }
+        return Some((
+            workspace.to_string(),
+            sandbox.to_string(),
+            service.to_string(),
+        ));
+    }
+    None
+}
+
+/// Resolve either a legacy readable service host or an opaque hashed host.
+pub async fn resolve_service_host(state: &ServerState, host: &str) -> Option<ServiceRouteTarget> {
+    if let Some((workspace, sandbox, service)) = parse_host(host, &state.config.service_routing) {
+        return Some(ServiceRouteTarget::new(&workspace, &sandbox, &service));
+    }
+
+    let gateway_name = state.config.service_routing_discriminator()?;
+    let label = service_host_label(host, &state.config.service_routing)?;
+    if !is_hash_label(label) {
+        return None;
+    }
+    if let Some(target) = state.service_route_index.lookup(label) {
+        return Some(target);
+    }
+
+    // A gateway can begin receiving traffic before an endpoint is exposed on
+    // this replica, so reload from durable state before treating it as a
+    // normal, non-service request — but at most once per debounce window.
+    // Unknown labels reach this point before authentication, and without the
+    // debounce each one would trigger a full all-workspace endpoint scan.
+    if let Err(error) = state
+        .service_route_index
+        .rebuild_if_stale(&state.store)
+        .await
+    {
+        warn!(error = %error, gateway_name, "failed to refresh service routing index");
+        return None;
+    }
+    state.service_route_index.lookup(label)
+}
+
+fn service_host_label<'a>(host: &'a str, config: &ServiceRoutingConfig) -> Option<&'a str> {
+    let host = host.split_once(':').map_or(host, |(name, _)| name);
+    for base_domain in &config.base_domains {
+        let suffix = format!(".{base_domain}");
+        if let Some(label) = host.strip_suffix(&suffix)
+            && !label.is_empty()
+            && !label.contains('.')
+        {
+            return Some(label);
+        }
+    }
+    None
+}
+
+fn is_hash_label(label: &str) -> bool {
+    label.len() == 16
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
+}
+
+#[cfg(test)]
+pub fn is_sandbox_service_request<B>(req: &Request<B>, config: &ServiceRoutingConfig) -> bool {
+    request_host(req).is_some_and(|host| parse_host(host, config).is_some())
+}
+
+pub fn service_request_host<B>(req: &Request<B>) -> Option<String> {
+    request_host(req).map(str::to_string)
+}
+
+pub async fn is_sandbox_service_request_with_state(
+    host: Option<String>,
+    state: &ServerState,
+) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    resolve_service_host(state, &host).await.is_some()
+}
+
+pub async fn proxy_sandbox_service_request(
+    state: Arc<ServerState>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    let Some(host) = request_host(&req).map(str::to_string) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(target) = resolve_service_host(&state, &host).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let ServiceRouteTarget {
+        workspace,
+        sandbox: sandbox_name,
+        service,
+    } = target;
+    let service_name = service.unwrap_or_default();
+
+    match proxy_to_endpoint(state, req, &workspace, sandbox_name, service_name).await {
+        Ok(response) => response.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServiceRouteError {
+    status: StatusCode,
+    message: &'static str,
+    reason: &'static str,
+}
+
+impl ServiceRouteError {
+    const fn new(status: StatusCode, message: &'static str, reason: &'static str) -> Self {
+        Self {
+            status,
+            message,
+            reason,
+        }
+    }
+
+    const fn endpoint_not_found() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "Service endpoint not found",
+            "service endpoint not found",
+        )
+    }
+
+    const fn endpoint_unavailable() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "Service endpoint is not available",
+            "service endpoint unavailable",
+        )
+    }
+
+    const fn sandbox_not_ready() -> Self {
+        Self::new(
+            StatusCode::PRECONDITION_FAILED,
+            "Sandbox is not ready",
+            "sandbox not ready",
+        )
+    }
+
+    const fn service_unreachable() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "Service endpoint is not reachable",
+            "service endpoint unreachable",
+        )
+    }
+
+    const fn invalid_request() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid service request",
+            "invalid service request",
+        )
+    }
+
+    const fn internal_error() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Service endpoint is not available",
+            "service endpoint internal error",
+        )
+    }
+}
+
+impl IntoResponse for ServiceRouteError {
+    fn into_response(self) -> AxumResponse {
+        service_error_response(self.status, self.message)
+    }
+}
+
+pub fn service_error_response(status: StatusCode, message: &'static str) -> AxumResponse {
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        message,
+    )
+        .into_response()
+}
+
+async fn proxy_to_endpoint(
+    state: Arc<ServerState>,
+    mut req: Request<Body>,
+    workspace: &str,
+    sandbox_name: String,
+    service_name: String,
+) -> Result<Response<Body>, ServiceRouteError> {
+    let endpoint = match load_endpoint(&state.store, workspace, &sandbox_name, &service_name).await
+    {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            emit_service_http_failure(&state, &req, &sandbox_name, &service_name, None, &err);
+            return Err(err);
+        }
+    };
+    if !endpoint.domain || endpoint.target_port == 0 || endpoint.target_port > u32::from(u16::MAX) {
+        let err = ServiceRouteError::endpoint_unavailable();
+        emit_service_http_failure(
+            &state,
+            &req,
+            &sandbox_name,
+            &service_name,
+            Some(&endpoint),
+            &err,
+        );
+        return Err(err);
+    }
+
+    let sandbox = match state
+        .store
+        .get_message::<Sandbox>(&endpoint.sandbox_id)
+        .await
+    {
+        Ok(Some(sandbox)) => sandbox,
+        Ok(None) => {
+            let err = ServiceRouteError::endpoint_unavailable();
+            emit_service_http_failure(
+                &state,
+                &req,
+                &sandbox_name,
+                &service_name,
+                Some(&endpoint),
+                &err,
+            );
+            return Err(err);
+        }
+        Err(err) => {
+            warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: failed to load sandbox");
+            let route_err = ServiceRouteError::internal_error();
+            emit_service_http_failure(
+                &state,
+                &req,
+                &sandbox_name,
+                &service_name,
+                Some(&endpoint),
+                &route_err,
+            );
+            return Err(route_err);
+        }
+    };
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+        let err = ServiceRouteError::sandbox_not_ready();
+        emit_service_http_failure(
+            &state,
+            &req,
+            &sandbox_name,
+            &service_name,
+            Some(&endpoint),
+            &err,
+        );
+        return Err(err);
+    }
+    let Ok(target_port) = u16::try_from(endpoint.target_port) else {
+        let err = ServiceRouteError::endpoint_unavailable();
+        emit_service_http_failure(
+            &state,
+            &req,
+            &sandbox_name,
+            &service_name,
+            Some(&endpoint),
+            &err,
+        );
+        return Err(err);
+    };
+    if upstream_uri_path(&req).is_err() {
+        let err = ServiceRouteError::invalid_request();
+        emit_service_http_failure(
+            &state,
+            &req,
+            &sandbox_name,
+            &service_name,
+            Some(&endpoint),
+            &err,
+        );
+        return Err(err);
+    }
+    let authorization_mode = effective_authorization_mode(endpoint.authorization_mode);
+    if validate_application_authorization(&req, authorization_mode).is_err() {
+        let err = ServiceRouteError::invalid_request();
+        emit_service_http_failure(
+            &state,
+            &req,
+            &sandbox_name,
+            &service_name,
+            Some(&endpoint),
+            &err,
+        );
+        return Err(err);
+    }
+
+    let websocket_upgrade = is_websocket_upgrade(&req);
+    let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
+
+    // An upgrade takes the connection over, so it is never pooled.
+    let pool_key = upstream_pool_key(endpoint.object_id(), target_port);
+    let pooled = if websocket_upgrade {
+        None
+    } else {
+        state.service_upstreams.take(&pool_key)
+    };
+
+    let reused = pooled.is_some();
+    let mut sender = match pooled {
+        Some(sender) => sender,
+        None => open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?,
+    };
+
+    let upstream = build_upstream_request(req, target_port, websocket_upgrade, authorization_mode)?;
+    let replay = reused.then(|| replayable_request(&upstream)).flatten();
+    let first_attempt = if reused {
+        sender.try_send_request(upstream).await.map_err(|mut err| {
+            let request = err.take_message();
+            (err.into_error(), request)
+        })
+    } else {
+        sender
+            .send_request(upstream)
+            .await
+            .map_err(|err| (err, None))
+    };
+    let mut response = match first_attempt {
+        Ok(response) => response,
+        Err((err, recovered)) => {
+            warn!(error = %err, "sandbox service routing: upstream HTTP request failed");
+            state.service_upstreams.evict(&pool_key);
+            let Some(retry_request) = recovered.or(replay) else {
+                let route_err = ServiceRouteError::service_unreachable();
+                emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+                return Err(route_err);
+            };
+            sender =
+                open_upstream(&state, &sandbox, &endpoint, target_port, websocket_upgrade).await?;
+            sender.send_request(retry_request).await.map_err(|err| {
+                warn!(error = %err, "sandbox service routing: upstream HTTP retry failed");
+                let route_err = ServiceRouteError::service_unreachable();
+                emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+                route_err
+            })?
+        }
+    };
+
+    if !websocket_upgrade {
+        state.service_upstreams.put(&pool_key, sender);
+    }
+
+    if websocket_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let upstream_upgrade = hyper::upgrade::on(&mut response);
+        let downstream_upgrade = downstream_upgrade.ok_or_else(|| {
+            let err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(&endpoint, target_port, "websocket upgrade unavailable");
+            err
+        })?;
+        tokio::spawn(async move {
+            match (downstream_upgrade.await, upstream_upgrade.await) {
+                (Ok(downstream), Ok(upstream)) => {
+                    let mut downstream = TokioIo::new(downstream);
+                    let mut upstream = TokioIo::new(upstream);
+                    let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                    let _ = downstream.shutdown().await;
+                    let _ = upstream.shutdown().await;
+                }
+                (Err(err), _) => {
+                    warn!(error = %err, "sandbox service routing: downstream WebSocket upgrade failed");
+                }
+                (_, Err(err)) => {
+                    warn!(error = %err, "sandbox service routing: upstream WebSocket upgrade failed");
+                }
+            }
+        });
+
+        let (parts, _) = response.into_parts();
+        return Ok(Response::from_parts(parts, Body::empty()));
+    }
+
+    let (parts, body) = response.into_parts();
+    Ok(Response::from_parts(parts, Body::new(body)))
+}
+
+async fn open_upstream(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+    endpoint: &ServiceEndpoint,
+    target_port: u16,
+    websocket_upgrade: bool,
+) -> Result<UpstreamSender, ServiceRouteError> {
+    let (_channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        relay_open::Target::Tcp(TcpRelayTarget {
+            host: RELAY_TARGET_HOST.to_string(),
+            port: u32::from(target_port),
+        }),
+        endpoint.object_id().to_string(),
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|err| {
+        warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");
+        let route_err = ServiceRouteError::service_unreachable();
+        emit_service_relay_failure(endpoint, target_port, route_err.reason);
+        route_err
+    })?;
+
+    let relay = tokio::time::timeout(Duration::from_secs(10), relay_rx)
+        .await
+        .map_err(|_| {
+            let err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, "relay claim timed out");
+            err
+        })?
+        .map_err(|_| {
+            let err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, "relay claim canceled");
+            err
+        })?
+        .map_err(|err| {
+            warn!(error = %err, "sandbox service routing: relay target open failed");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+
+    let (sender, conn) = hyper::client::conn::http1::Builder::new()
+        .handshake(TokioIo::new(relay))
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+
+    if websocket_upgrade {
+        tokio::spawn(async move {
+            if let Err(err) = conn.with_upgrades().await {
+                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(err) = conn.await {
+                warn!(error = %err, "sandbox service routing: upstream HTTP connection failed");
+            }
+        });
+    }
+
+    Ok(sender)
+}
+
+async fn load_endpoint(
+    store: &Store,
+    workspace: &str,
+    sandbox_name: &str,
+    service_name: &str,
+) -> Result<ServiceEndpoint, ServiceRouteError> {
+    let key = endpoint_key(sandbox_name, service_name);
+    store
+        .get_message_by_name::<ServiceEndpoint>(workspace, &key)
+        .await
+        .map_err(|err| {
+            warn!(error = %err, endpoint = %key, "sandbox service routing: failed to load service endpoint");
+            ServiceRouteError::internal_error()
+        })?
+        .ok_or_else(ServiceRouteError::endpoint_not_found)
+}
+
+/// Copies a request that can be sent again on a fresh connection.
+///
+/// A pooled connection can be closed by the sandbox between the liveness check
+/// and the send. Only bodyless methods are replayable, because the original
+/// body is consumed by the failed attempt.
+fn replayable_request(request: &Request<Body>) -> Option<Request<Body>> {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return None;
+    }
+    let mut replay = Request::new(Body::empty());
+    *replay.method_mut() = request.method().clone();
+    *replay.uri_mut() = request.uri().clone();
+    *replay.version_mut() = request.version();
+    *replay.headers_mut() = request.headers().clone();
+    Some(replay)
+}
+
+fn build_upstream_request(
+    req: Request<Body>,
+    target_port: u16,
+    preserve_upgrade_headers: bool,
+    authorization_mode: ServiceAuthorizationMode,
+) -> Result<Request<Body>, ServiceRouteError> {
+    let (parts, body) = req.into_parts();
+    let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
+    let uri = path
+        .parse::<http::Uri>()
+        .map_err(|_| ServiceRouteError::invalid_request())?;
+
+    let mut builder = Request::builder()
+        .method(parts.method)
+        .uri(uri)
+        .version(http::Version::HTTP_11);
+
+    let headers = builder
+        .headers_mut()
+        .ok_or_else(ServiceRouteError::internal_error)?;
+    for (name, value) in &parts.headers {
+        if (is_hop_by_hop_header(name)
+            && !(preserve_upgrade_headers && is_websocket_hop_by_hop_header(name)))
+            || is_gateway_auth_header(name, authorization_mode)
+        {
+            continue;
+        }
+        if name == header::COOKIE {
+            if let Some(cookie) = sanitize_cookie_header(value) {
+                headers.append(name, cookie);
+            }
+            continue;
+        }
+        headers.append(name, value.clone());
+    }
+    headers.insert(
+        header::HOST,
+        format!("127.0.0.1:{target_port}").parse().unwrap(),
+    );
+
+    builder
+        .body(body)
+        .map_err(|_| ServiceRouteError::internal_error())
+}
+
+fn upstream_uri_path(req: &Request<Body>) -> Result<&str, ServiceRouteError> {
+    let path = req.uri().path_and_query().map_or("/", |path| path.as_str());
+    path.parse::<http::Uri>()
+        .map(|_| path)
+        .map_err(|_| ServiceRouteError::invalid_request())
+}
+
+fn host_header(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::HOST)?.to_str().ok()
+}
+
+pub fn request_host<B>(req: &Request<B>) -> Option<&str> {
+    host_header(req.headers()).or_else(|| req.uri().authority().map(http::uri::Authority::as_str))
+}
+
+fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
+    req.method() == Method::GET
+        && header_value_is(req.headers(), header::UPGRADE, "websocket")
+        && header_contains_token(req.headers(), header::CONNECTION, "upgrade")
+}
+
+fn header_value_is(headers: &HeaderMap, name: header::HeaderName, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn header_contains_token(headers: &HeaderMap, name: header::HeaderName, token: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+}
+
+fn is_hop_by_hop_header(name: &header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "host"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn is_websocket_hop_by_hop_header(name: &header::HeaderName) -> bool {
+    matches!(name.as_str(), "connection" | "upgrade")
+}
+
+pub fn effective_authorization_mode(value: i32) -> ServiceAuthorizationMode {
+    match ServiceAuthorizationMode::try_from(value) {
+        Ok(ServiceAuthorizationMode::BearerPassthrough) => {
+            ServiceAuthorizationMode::BearerPassthrough
+        }
+        Ok(ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip) | Err(_) => {
+            ServiceAuthorizationMode::Strip
+        }
+    }
+}
+
+fn authorization_mode_label(value: i32) -> &'static str {
+    match effective_authorization_mode(value) {
+        ServiceAuthorizationMode::BearerPassthrough => "bearer_passthrough",
+        ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip => "strip",
+    }
+}
+
+fn validate_application_authorization<B>(
+    req: &Request<B>,
+    authorization_mode: ServiceAuthorizationMode,
+) -> Result<(), ServiceRouteError> {
+    if authorization_mode != ServiceAuthorizationMode::BearerPassthrough {
+        return Ok(());
+    }
+
+    let mut values = req.headers().get_all(header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(ServiceRouteError::invalid_request());
+    }
+
+    let value = value
+        .to_str()
+        .map_err(|_| ServiceRouteError::invalid_request())?;
+    match openshell_core::auth::strip_bearer_scheme(value) {
+        Some(credential) if is_bearer_token68(credential) => Ok(()),
+        _ => Err(ServiceRouteError::invalid_request()),
+    }
+}
+
+fn is_bearer_token68(value: &str) -> bool {
+    let mut saw_data = false;
+    let mut saw_padding = false;
+    for byte in value.bytes() {
+        if byte == b'=' {
+            saw_padding = true;
+        } else if !saw_padding
+            && (byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/'))
+        {
+            saw_data = true;
+        } else {
+            return false;
+        }
+    }
+    saw_data
+}
+
+fn is_gateway_auth_header(
+    name: &header::HeaderName,
+    authorization_mode: ServiceAuthorizationMode,
+) -> bool {
+    match name.as_str() {
+        "authorization" => authorization_mode != ServiceAuthorizationMode::BearerPassthrough,
+        "cf-access-jwt-assertion"
+        | "x-forwarded-client-cert"
+        | "x-ssl-client-cert"
+        | "x-client-cert" => true,
+        _ => false,
+    }
+}
+
+fn sanitize_cookie_header(value: &HeaderValue) -> Option<HeaderValue> {
+    let value = value.to_str().ok()?;
+    let cookies = value
+        .split(';')
+        .filter_map(|cookie| {
+            let cookie = cookie.trim();
+            let (name, _) = cookie.split_once('=')?;
+            (!is_gateway_auth_cookie(name.trim())).then_some(cookie)
+        })
+        .collect::<Vec<_>>();
+
+    if cookies.is_empty() {
+        return None;
+    }
+
+    HeaderValue::from_str(&cookies.join("; ")).ok()
+}
+
+fn is_gateway_auth_cookie(name: &str) -> bool {
+    name.eq_ignore_ascii_case("CF_Authorization") || name.eq_ignore_ascii_case("cf-authorization")
+}
+
+pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {
+    let event = build_service_endpoint_config_event(endpoint, url, created);
+    openshell_ocsf::ocsf_emit!(event);
+}
+
+pub fn emit_service_endpoint_delete_event(endpoint: &ServiceEndpoint) {
+    let event = build_service_endpoint_delete_event(endpoint);
+    openshell_ocsf::ocsf_emit!(event);
+}
+
+pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Request<Body>) {
+    let Some(host) = request_host(req) else {
+        return;
+    };
+    // `parse_host` only understands readable hosts; hashed service hosts
+    // recover their identity from the route index instead.
+    let Some((sandbox_name, service_name)) = parse_host(host, &state.config.service_routing)
+        .map(|(_, sandbox, service)| (sandbox, service))
+        .or_else(|| hashed_host_event_identity(state, host))
+    else {
+        return;
+    };
+    let err = ServiceRouteError::new(
+        StatusCode::FORBIDDEN,
+        "Cross-origin service request rejected",
+        "cross-origin service request rejected",
+    );
+    emit_service_http_failure(state, req, &sandbox_name, &service_name, None, &err);
+}
+
+/// Recover the sandbox/service identity of a hashed service host for
+/// cross-origin rejection events.
+///
+/// Mirrors the hashed-host half of `resolve_service_host`, but consults only
+/// the in-memory route index: this emitter runs on the request path, and
+/// `resolve_service_host` rebuilds the index from durable state on a miss —
+/// a step a hostile client must not be able to trigger per rejected request.
+fn hashed_host_event_identity(state: &ServerState, host: &str) -> Option<(String, String)> {
+    // Hashed service hosts only exist when hashed hostname format is
+    // enabled; without it a hash-shaped label is an ordinary hostname.
+    state.config.service_routing_discriminator()?;
+    let label = service_host_label(host, &state.config.service_routing)?;
+    if !is_hash_label(label) {
+        return None;
+    }
+    Some(match state.service_route_index.lookup(label) {
+        Some(target) => (target.sandbox, target.service.unwrap_or_default()),
+        // Unknown label (e.g. the endpoint was removed after the request was
+        // classified as a service request). Attribute the event to the raw
+        // label so the rejection stays visible: a hashed host carries no
+        // readable sandbox/service split, and the full hostname is already
+        // recorded in the event's dst_endpoint.
+        None => (label.to_string(), String::new()),
+    })
+}
+
+fn emit_service_http_failure(
+    state: &ServerState,
+    req: &Request<Body>,
+    sandbox_name: &str,
+    service_name: &str,
+    endpoint: Option<&ServiceEndpoint>,
+    err: &ServiceRouteError,
+) {
+    let event = build_service_http_failure_event(
+        state.config.bind_address.port(),
+        req,
+        sandbox_name,
+        service_name,
+        endpoint,
+        err,
+    );
+    openshell_ocsf::ocsf_emit!(event);
+}
+
+fn emit_service_relay_failure(endpoint: &ServiceEndpoint, target_port: u16, reason: &str) {
+    let event = build_service_relay_failure_event(endpoint, target_port, reason);
+    openshell_ocsf::ocsf_emit!(event);
+}
+
+fn build_service_endpoint_config_event(
+    endpoint: &ServiceEndpoint,
+    url: &str,
+    created: bool,
+) -> OcsfEvent {
+    let service_label = service_display_name(&endpoint.sandbox, &endpoint.name);
+    let state_label = if created {
+        "service_endpoint_created"
+    } else {
+        "service_endpoint_updated"
+    };
+    let ctx = gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox);
+    let mut builder = ConfigStateChangeBuilder::new(&ctx)
+        .state(StateId::Enabled, state_label)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message(format!(
+            "Service endpoint exposed {service_label} -> {RELAY_TARGET_HOST}:{}",
+            endpoint.target_port
+        ))
+        .unmapped("endpoint_name", endpoint_name(endpoint))
+        .unmapped("service_name", endpoint.name.clone())
+        .unmapped("target_port", u64::from(endpoint.target_port))
+        .unmapped(
+            "authorization_mode",
+            authorization_mode_label(endpoint.authorization_mode),
+        );
+
+    if !url.is_empty() {
+        builder = builder.unmapped("url", url.to_string());
+    }
+
+    builder.build()
+}
+
+fn build_service_endpoint_delete_event(endpoint: &ServiceEndpoint) -> OcsfEvent {
+    let service_label = service_display_name(&endpoint.sandbox, &endpoint.name);
+    ConfigStateChangeBuilder::new(&gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox))
+        .state(StateId::Disabled, "service_endpoint_deleted")
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message(format!("Service endpoint deleted {service_label}"))
+        .unmapped("endpoint_name", endpoint_name(endpoint))
+        .unmapped("service_name", endpoint.name.clone())
+        .unmapped("target_port", u64::from(endpoint.target_port))
+        .unmapped(
+            "authorization_mode",
+            authorization_mode_label(endpoint.authorization_mode),
+        )
+        .build()
+}
+
+fn build_service_http_failure_event(
+    bind_port: u16,
+    req: &Request<Body>,
+    sandbox_name: &str,
+    service_name: &str,
+    endpoint: Option<&ServiceEndpoint>,
+    err: &ServiceRouteError,
+) -> OcsfEvent {
+    let host = request_host(req).unwrap_or("unknown");
+    let (hostname, port) = split_authority_for_event(host, bind_port);
+    let ctx = gateway_ocsf_ctx(
+        endpoint.map_or("", |endpoint| endpoint.sandbox_id.as_str()),
+        sandbox_name,
+    );
+    HttpActivityBuilder::new(&ctx)
+        .activity(http_activity_for_method(req.method()))
+        .action(ActionId::Denied)
+        .disposition(if err.status.is_server_error() {
+            DispositionId::Error
+        } else {
+            DispositionId::Blocked
+        })
+        .severity(if err.status.is_server_error() {
+            SeverityId::Low
+        } else {
+            SeverityId::Medium
+        })
+        .status(StatusId::Failure)
+        .http_request(HttpRequest::new(
+            req.method().as_str(),
+            OcsfUrl::new("http", &hostname, req.uri().path(), port),
+        ))
+        .http_response(OcsfHttpResponse {
+            code: err.status.as_u16(),
+        })
+        .dst_endpoint(Endpoint::from_domain(&hostname, port))
+        .firewall_rule(ROUTING_RULE_NAME, ROUTING_RULE_TYPE)
+        .status_detail(err.reason)
+        .message(format!(
+            "{}: {}",
+            err.message,
+            service_display_name(sandbox_name, service_name)
+        ))
+        .build()
+}
+
+fn build_service_relay_failure_event(
+    endpoint: &ServiceEndpoint,
+    target_port: u16,
+    reason: &str,
+) -> OcsfEvent {
+    NetworkActivityBuilder::new(&gateway_ocsf_ctx(&endpoint.sandbox_id, &endpoint.sandbox))
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Error)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_ip_str(RELAY_TARGET_HOST, target_port))
+        .firewall_rule(RELAY_RULE_NAME, ROUTING_RULE_TYPE)
+        .status_detail(reason)
+        .message(format!(
+            "Service endpoint is not reachable: {}",
+            service_display_name(&endpoint.sandbox, &endpoint.name)
+        ))
+        .unmapped("endpoint_name", endpoint_name(endpoint))
+        .unmapped("service_name", endpoint.name.clone())
+        .build()
+}
+
+fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
+    crate::gateway_ocsf::context(sandbox_id, sandbox_name)
+}
+
+fn endpoint_name(endpoint: &ServiceEndpoint) -> String {
+    endpoint.metadata.as_ref().map_or_else(
+        || endpoint_key(&endpoint.sandbox, &endpoint.name),
+        |metadata| metadata.name.clone(),
+    )
+}
+
+fn service_display_name(sandbox_name: &str, service_name: &str) -> String {
+    if service_name.is_empty() {
+        sandbox_name.to_string()
+    } else {
+        format!("{sandbox_name}/{service_name}")
+    }
+}
+
+fn split_authority_for_event(authority: &str, default_port: u16) -> (String, u16) {
+    let authority = authority.trim();
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) => (
+            host.trim_end_matches('.').to_ascii_lowercase(),
+            port.parse().unwrap_or(default_port),
+        ),
+        _ => (
+            authority.trim_end_matches('.').to_ascii_lowercase(),
+            default_port,
+        ),
+    }
+}
+
+fn http_activity_for_method(method: &Method) -> ActivityId {
+    match method.as_str() {
+        "CONNECT" => ActivityId::Open,
+        "DELETE" => ActivityId::Close,
+        "GET" => ActivityId::Reset,
+        "HEAD" => ActivityId::Fail,
+        "OPTIONS" => ActivityId::Refuse,
+        "POST" => ActivityId::Traffic,
+        "PUT" => ActivityId::Listen,
+        "TRACE" => ActivityId::Trace,
+        "PATCH" => ActivityId::Patch,
+        _ => ActivityId::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::config::ServiceHostnameFormat;
+
+    fn endpoint() -> ServiceEndpoint {
+        ServiceEndpoint {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "endpoint-id".to_string(),
+                name: "my-sandbox--web".to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                labels: HashMap::default(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            sandbox_id: "sandbox-id".to_string(),
+            sandbox: "my-sandbox".to_string(),
+            name: "web".to_string(),
+            target_port: 8080,
+            domain: true,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
+        }
+    }
+
+    fn config() -> ServiceRoutingConfig {
+        ServiceRoutingConfig {
+            base_domains: vec![
+                "dev.openshell.localhost".to_string(),
+                "svc.gateway.localhost".to_string(),
+            ],
+            ..ServiceRoutingConfig::default()
+        }
+    }
+
+    fn tls_config() -> openshell_core::TlsConfig {
+        openshell_core::TlsConfig {
+            cert_path: "server.crt".into(),
+            key_path: "server.key".into(),
+            client_ca_path: Some("ca.crt".into()),
+            require_client_auth: false,
+            external_cert_path: None,
+            external_key_path: None,
+            external_server_names: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn endpoint_url_uses_plain_http_for_loopback_tls_gateway() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"]);
+
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("http://default--my-sandbox--web.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn endpoint_url_omits_service_label_for_empty_service_name() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"]);
+
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "").as_deref(),
+            Some("http://default--my-sandbox.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn endpoint_url_keeps_https_for_non_loopback_tls_gateway() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("0.0.0.0:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"]);
+
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("https://default--my-sandbox--web.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn endpoint_url_keeps_https_when_loopback_plaintext_http_is_disabled() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"])
+            .with_loopback_service_http(false);
+
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("https://default--my-sandbox--web.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn endpoint_url_includes_workspace_prefix_for_non_default() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"]);
+
+        assert_eq!(
+            endpoint_url(&cfg, "staging", "my-sandbox", "web").as_deref(),
+            Some("http://staging--my-sandbox--web.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn service_route_hash_label_uses_stable_fixed_vectors() {
+        assert_eq!(
+            service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web")),
+            "enh47uqyj7bpyttz"
+        );
+        assert_eq!(
+            service_route_hash_label("gateway-a", "default", "my-sandbox", None),
+            "eiud2z5apv3yeucg"
+        );
+        assert_eq!(
+            service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web")),
+            service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"))
+        );
+    }
+
+    #[test]
+    fn endpoint_url_uses_hash_label_when_gateway_name_is_configured() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"])
+            .with_name("gateway-a")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("http://enh47uqyj7bpyttz.dev.openshell.localhost:8080/")
+        );
+        assert_eq!(
+            endpoint_url(&cfg, "default", "my-sandbox", "").as_deref(),
+            Some("http://eiud2z5apv3yeucg.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn service_route_index_is_idempotent_and_removes_matching_target() {
+        let index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        index.register("default", "my-sandbox", "web").unwrap();
+        index.register("default", "my-sandbox", "web").unwrap();
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        assert!(index.lookup(&label).is_some());
+        index.remove("default", "other-sandbox", "web");
+        assert!(index.lookup(&label).is_some());
+        index.remove("default", "my-sandbox", "web");
+        assert!(index.lookup(&label).is_none());
+    }
+
+    #[tokio::test]
+    async fn service_route_index_rebuilds_persisted_endpoints() {
+        use prost::Message;
+
+        let store = crate::persistence::test_store().await;
+        let endpoint = endpoint();
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                endpoint.object_id(),
+                "my-sandbox--web",
+                "default",
+                &endpoint.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+        let index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        index.rebuild(&store).await.unwrap();
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        assert_eq!(
+            index.lookup(&label),
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+    }
+
+    #[tokio::test]
+    async fn miss_triggered_rebuilds_are_debounced() {
+        use prost::Message;
+
+        let store = crate::persistence::test_store().await;
+        let endpoint = endpoint();
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                endpoint.object_id(),
+                "my-sandbox--web",
+                "default",
+                &endpoint.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+
+        let mut index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        // A long debounce makes the test deterministic without a clock.
+        index.set_rebuild_debounce(Duration::from_mins(10));
+
+        // The first miss-triggered rebuild runs: the index never rebuilt.
+        assert!(index.rebuild_if_stale(&store).await.unwrap());
+        assert_eq!(
+            index.lookup(&label),
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+
+        // Remove the entry in memory; a second miss within the window must
+        // not trigger another full-store rebuild.
+        index.remove("default", "my-sandbox", "web");
+        assert!(!index.rebuild_if_stale(&store).await.unwrap());
+        assert_eq!(index.lookup(&label), None);
+
+        // An explicit rebuild bypasses the debounce.
+        index.rebuild(&store).await.unwrap();
+        assert_eq!(
+            index.lookup(&label),
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+    }
+
+    #[tokio::test]
+    async fn miss_triggered_rebuild_runs_when_the_debounce_is_zero() {
+        use prost::Message;
+
+        let store = crate::persistence::test_store().await;
+        let endpoint = endpoint();
+        store
+            .put_if(
+                ServiceEndpoint::object_type(),
+                endpoint.object_id(),
+                "my-sandbox--web",
+                "default",
+                &endpoint.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+
+        let mut index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        index.set_rebuild_debounce(Duration::ZERO);
+        assert!(index.rebuild_if_stale(&store).await.unwrap());
+        index.remove("default", "my-sandbox", "web");
+        // Zero debounce: every miss may rebuild from durable state.
+        assert!(index.rebuild_if_stale(&store).await.unwrap());
+        assert_eq!(
+            index.lookup(&label),
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+    }
+
+    #[test]
+    fn service_route_index_rejects_seeded_collision() {
+        let index = ServiceRouteIndex::new(Some("gateway-a".to_string()));
+        let label = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        index
+            .entries
+            .write()
+            .unwrap()
+            .insert(label, ServiceRouteTarget::new("other", "sandbox", "web"));
+        assert!(index.register("default", "my-sandbox", "web").is_err());
+    }
+
+    async fn hashed_gateway_state() -> Arc<ServerState> {
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = state_mut
+            .config
+            .clone()
+            .with_server_sans(["*.dev.openshell.localhost"])
+            .with_name("gateway-a")
+            .with_service_hostname_format(ServiceHostnameFormat::Hashed);
+        state_mut.service_route_index =
+            Arc::new(ServiceRouteIndex::new(Some("gateway-a".to_string())));
+        state
+    }
+
+    #[tokio::test]
+    async fn hashed_hosts_resolve_and_unknown_hashes_are_not_service_requests() {
+        let state = hashed_gateway_state().await;
+        state
+            .service_route_index
+            .register("default", "my-sandbox", "web")
+            .unwrap();
+
+        let hash = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        assert_eq!(
+            resolve_service_host(&state, &format!("{hash}.dev.openshell.localhost")).await,
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+        assert_eq!(
+            resolve_service_host(&state, "aaaaaaaaaaaaaaaa.dev.openshell.localhost").await,
+            None
+        );
+        assert_eq!(
+            resolve_service_host(&state, "default--my-sandbox--web.dev.openshell.localhost").await,
+            Some(ServiceRouteTarget::new("default", "my-sandbox", "web"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_rejection_for_hashed_service_host_emits_ocsf_event() {
+        let state = hashed_gateway_state().await;
+        state
+            .service_route_index
+            .register("default", "my-sandbox", "web")
+            .unwrap();
+
+        let hash = service_route_hash_label("gateway-a", "default", "my-sandbox", Some("web"));
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/private")
+            .header(header::HOST, format!("{hash}.dev.openshell.localhost"))
+            .body(Body::empty())
+            .unwrap();
+
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        {
+            let _guard = capture.install();
+            emit_cross_origin_service_http_rejection(&state, &request);
+        }
+
+        let seen = capture.json_events();
+        assert_eq!(seen.len(), 1, "hashed-host rejection must emit one event");
+        assert_eq!(seen[0]["class_uid"], 4002);
+        assert_eq!(seen[0]["http_response"]["code"], 403);
+        assert_eq!(
+            seen[0]["message"],
+            "Cross-origin service request rejected: my-sandbox/web"
+        );
+        assert_eq!(
+            seen[0]["dst_endpoint"]["domain"],
+            format!("{hash}.dev.openshell.localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_rejection_for_unknown_hashed_label_emits_ocsf_event() {
+        let state = hashed_gateway_state().await;
+        // Nothing is registered: the label is hash-shaped but unknown.
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/private")
+            .header(header::HOST, "aaaaaaaaaaaaaaaa.dev.openshell.localhost")
+            .body(Body::empty())
+            .unwrap();
+
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        {
+            let _guard = capture.install();
+            emit_cross_origin_service_http_rejection(&state, &request);
+        }
+
+        let seen = capture.json_events();
+        assert_eq!(seen.len(), 1, "an unknown hashed label must still emit");
+        assert_eq!(
+            seen[0]["message"],
+            "Cross-origin service request rejected: aaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_rejection_skips_non_service_hosts() {
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = state_mut
+            .config
+            .clone()
+            .with_server_sans(["*.dev.openshell.localhost"]);
+
+        for host in [
+            "api.dev.openshell.localhost",
+            // Hash-shaped, but hashed service hosts require a gateway name.
+            "aaaaaaaaaaaaaaaa.dev.openshell.localhost",
+            "127.0.0.1:8080",
+        ] {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap();
+
+            let capture = openshell_ocsf::test_support::OcsfCapture::default();
+            {
+                let _guard = capture.install();
+                emit_cross_origin_service_http_rejection(&state, &request);
+            }
+
+            assert!(
+                capture.events().is_empty(),
+                "{host} is not a service host and must not emit"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_sandbox_service_host() {
+        assert_eq!(
+            parse_host(
+                "default--my-sandbox--web.dev.openshell.localhost",
+                &config()
+            ),
+            Some((
+                "default".to_string(),
+                "my-sandbox".to_string(),
+                "web".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_sandbox_host_without_service_label() {
+        assert_eq!(
+            parse_host("default--my-sandbox.dev.openshell.localhost", &config()),
+            Some((
+                "default".to_string(),
+                "my-sandbox".to_string(),
+                String::new()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_service_label_separator() {
+        assert_eq!(
+            parse_host("my-sandbox--.dev.openshell.localhost", &config()),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_sandbox_service_host_with_port() {
+        assert_eq!(
+            parse_host(
+                "default--my-sandbox--web.dev.openshell.localhost:8080",
+                &config()
+            ),
+            Some((
+                "default".to_string(),
+                "my-sandbox".to_string(),
+                "web".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_alternate_service_routing_domain() {
+        assert_eq!(
+            parse_host("default--my-sandbox--web.svc.gateway.localhost", &config()),
+            Some((
+                "default".to_string(),
+                "my-sandbox".to_string(),
+                "web".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_base_domain() {
+        assert_eq!(
+            parse_host("my-sandbox--web.prod.openshell.localhost", &config()),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_workspace_prefixed_host() {
+        assert_eq!(
+            parse_host(
+                "staging--my-sandbox--web.dev.openshell.localhost",
+                &config()
+            ),
+            Some((
+                "staging".to_string(),
+                "my-sandbox".to_string(),
+                "web".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_consecutive_hyphens_in_workspace() {
+        assert_eq!(
+            parse_host(
+                "team--ml--my-sandbox--web.dev.openshell.localhost",
+                &config()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_consecutive_hyphens_in_service() {
+        assert_eq!(
+            parse_host(
+                "default--my-sandbox--web--app.dev.openshell.localhost",
+                &config()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn identifies_sandbox_service_request_from_host_header() {
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "my-sandbox--web.dev.openshell.localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert!(is_sandbox_service_request(&request, &config()));
+    }
+
+    #[test]
+    fn identifies_sandbox_service_request_from_http2_authority() {
+        let request = Request::builder()
+            .uri("https://my-sandbox--web.dev.openshell.localhost/")
+            .body(Body::empty())
+            .unwrap();
+        assert!(is_sandbox_service_request(&request, &config()));
+    }
+
+    #[test]
+    fn ignores_non_sandbox_service_request() {
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "127.0.0.1:8080")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_sandbox_service_request(&request, &config()));
+    }
+
+    #[test]
+    fn service_route_errors_return_plain_text() {
+        let response = ServiceRouteError::sandbox_not_ready().into_response();
+
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn service_endpoint_config_event_includes_endpoint_metadata() {
+        let event =
+            build_service_endpoint_config_event(&endpoint(), "http://my-sandbox--web.local/", true);
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["class_uid"], 5019);
+        assert_eq!(json["unmapped"]["endpoint_name"], "my-sandbox--web");
+        assert_eq!(json["unmapped"]["service_name"], "web");
+        assert_eq!(json["unmapped"]["target_port"], 8080);
+        assert_eq!(json["unmapped"]["authorization_mode"], "strip");
+        assert!(
+            event
+                .format_shorthand()
+                .contains("Service endpoint exposed my-sandbox/web")
+        );
+    }
+
+    #[test]
+    fn service_endpoint_delete_event_includes_endpoint_metadata() {
+        let event = build_service_endpoint_delete_event(&endpoint());
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["class_uid"], 5019);
+        assert_eq!(json["unmapped"]["endpoint_name"], "my-sandbox--web");
+        assert_eq!(json["unmapped"]["service_name"], "web");
+        assert_eq!(json["unmapped"]["target_port"], 8080);
+        assert_eq!(json["unmapped"]["authorization_mode"], "strip");
+        assert!(
+            event
+                .format_shorthand()
+                .contains("Service endpoint deleted my-sandbox/web")
+        );
+    }
+
+    #[test]
+    fn service_http_failure_event_omits_query_strings() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/secret?token=should-not-log")
+            .header(
+                header::HOST,
+                "my-sandbox--web.dev.openshell.localhost:18080",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let err = ServiceRouteError::new(
+            StatusCode::FORBIDDEN,
+            "Cross-origin service request rejected",
+            "cross-origin service request rejected",
+        );
+        let event =
+            build_service_http_failure_event(18080, &request, "my-sandbox", "web", None, &err);
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["class_uid"], 4002);
+        assert_eq!(json["http_request"]["url"]["path"], "/secret");
+        assert_eq!(json["http_response"]["code"], 403);
+        assert!(!event.format_shorthand().contains("should-not-log"));
+    }
+
+    #[test]
+    fn service_relay_failure_event_records_loopback_target() {
+        let event = build_service_relay_failure_event(&endpoint(), 8080, "relay unavailable");
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["class_uid"], 4001);
+        assert_eq!(json["dst_endpoint"]["ip"], RELAY_TARGET_HOST);
+        assert_eq!(json["dst_endpoint"]["port"], 8080);
+        assert_eq!(json["unmapped"]["endpoint_name"], "my-sandbox--web");
+    }
+
+    #[test]
+    fn strips_gateway_auth_headers_from_upstream_request() {
+        let request = Request::builder()
+            .uri("https://my-sandbox--web.dev.openshell.localhost/path")
+            .header(header::AUTHORIZATION, "Bearer gateway-token")
+            .header("cf-access-jwt-assertion", "edge-token")
+            .header("x-forwarded-client-cert", "cert")
+            .header(
+                header::COOKIE,
+                "theme=dark; CF_Authorization=edge-cookie; app=session",
+            )
+            .header("x-app-header", "kept")
+            .body(Body::empty())
+            .unwrap();
+
+        let upstream =
+            build_upstream_request(request, 8080, false, ServiceAuthorizationMode::Strip).unwrap();
+
+        assert_eq!(upstream.uri(), "/path");
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+        assert!(!upstream.headers().contains_key("cf-access-jwt-assertion"));
+        assert!(!upstream.headers().contains_key("x-forwarded-client-cert"));
+        assert_eq!(
+            upstream.headers()[header::COOKIE],
+            "theme=dark; app=session"
+        );
+        assert_eq!(upstream.headers()["x-app-header"], "kept");
+    }
+
+    #[test]
+    fn unspecified_endpoint_authorization_mode_strips_authorization() {
+        let request = Request::builder()
+            .uri("/path")
+            .header(header::AUTHORIZATION, "Bearer application-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = effective_authorization_mode(ServiceAuthorizationMode::Unspecified as i32);
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert_eq!(mode, ServiceAuthorizationMode::Strip);
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn bearer_passthrough_preserves_valid_authorization_and_strips_gateway_identity() {
+        let request = Request::builder()
+            .uri("/path")
+            .header(header::AUTHORIZATION, "bEaReR application-token")
+            .header("cf-access-jwt-assertion", "edge-token")
+            .header("x-forwarded-client-cert", "cert")
+            .header(header::PROXY_AUTHORIZATION, "Basic proxy-secret")
+            .header(
+                header::COOKIE,
+                "theme=dark; CF_Authorization=edge-cookie; app=session",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert_eq!(
+            upstream.headers()[header::AUTHORIZATION],
+            "bEaReR application-token"
+        );
+        assert!(!upstream.headers().contains_key("cf-access-jwt-assertion"));
+        assert!(!upstream.headers().contains_key("x-forwarded-client-cert"));
+        assert!(!upstream.headers().contains_key(header::PROXY_AUTHORIZATION));
+        assert_eq!(
+            upstream.headers()[header::COOKIE],
+            "theme=dark; app=session"
+        );
+    }
+
+    #[test]
+    fn bearer_passthrough_allows_missing_authorization() {
+        let request = Request::builder().uri("/path").body(Body::empty()).unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, false, mode).unwrap();
+
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn bearer_passthrough_rejects_ambiguous_or_malformed_authorization() {
+        for value in [
+            "",
+            "Bearer",
+            "Bearer ",
+            "Basic abc",
+            "Bearer abc extra",
+            "Bearer abc,def",
+            "Bearer abc=def",
+            "Bearer\tabc",
+            " Bearer abc",
+        ] {
+            let request = Request::builder()
+                .uri("/path")
+                .header(header::AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            assert!(
+                validate_application_authorization(
+                    &request,
+                    ServiceAuthorizationMode::BearerPassthrough,
+                )
+                .is_err()
+            );
+        }
+
+        for value in ["Bearer abc", "bearer abc-._~+/==", "Bearer  abc"] {
+            let request = Request::builder()
+                .uri("/path")
+                .header(header::AUTHORIZATION, value)
+                .body(Body::empty())
+                .unwrap();
+            validate_application_authorization(
+                &request,
+                ServiceAuthorizationMode::BearerPassthrough,
+            )
+            .unwrap();
+        }
+
+        let mut request = Request::builder().uri("/path").body(Body::empty()).unwrap();
+        request.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first"),
+        );
+        request.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer second"),
+        );
+        assert!(
+            validate_application_authorization(
+                &request,
+                ServiceAuthorizationMode::BearerPassthrough,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn authorization_value_is_not_in_service_routing_events() {
+        const SENTINEL: &str = "never-log-this-capability";
+        let request = Request::builder()
+            .uri("/private")
+            .header(header::AUTHORIZATION, format!("Bearer {SENTINEL}"))
+            .body(Body::empty())
+            .unwrap();
+        let err = ServiceRouteError::invalid_request();
+        let event = build_service_http_failure_event(
+            18080,
+            &request,
+            "my-sandbox",
+            "web",
+            Some(&endpoint()),
+            &err,
+        );
+
+        assert!(!event.to_json().unwrap().to_string().contains(SENTINEL));
+        assert!(!event.format_shorthand().contains(SENTINEL));
+    }
+
+    #[test]
+    fn detects_websocket_upgrade_request() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/chat?session=main")
+            .header(header::CONNECTION, "keep-alive, Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(is_websocket_upgrade(&request));
+    }
+
+    #[test]
+    fn preserves_websocket_upgrade_headers_for_upstream_request() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://my-sandbox--web.dev.openshell.localhost/chat?session=main")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("sec-websocket-key", "abc")
+            .body(Body::empty())
+            .unwrap();
+
+        let upstream =
+            build_upstream_request(request, 8080, true, ServiceAuthorizationMode::Strip).unwrap();
+
+        assert_eq!(upstream.uri(), "/chat?session=main");
+        assert_eq!(upstream.headers()[header::CONNECTION], "Upgrade");
+        assert_eq!(upstream.headers()[header::UPGRADE], "websocket");
+        assert_eq!(upstream.headers()["sec-websocket-key"], "abc");
+        assert_eq!(upstream.headers()[header::HOST], "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn bearer_passthrough_preserves_authorization_on_websocket_upgrade() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/chat")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("sec-websocket-key", "abc")
+            .header(header::AUTHORIZATION, "Bearer application-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let mode = ServiceAuthorizationMode::BearerPassthrough;
+        validate_application_authorization(&request, mode).unwrap();
+        let upstream = build_upstream_request(request, 8080, true, mode).unwrap();
+
+        assert_eq!(
+            upstream.headers()[header::AUTHORIZATION],
+            "Bearer application-token"
+        );
+        assert_eq!(upstream.headers()[header::CONNECTION], "Upgrade");
+        assert_eq!(upstream.headers()[header::UPGRADE], "websocket");
+    }
+
+    #[tokio::test]
+    async fn load_endpoint_uses_workspace_for_lookup() {
+        let store = crate::persistence::test_store().await;
+
+        let ep = ServiceEndpoint {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "ep-1".to_string(),
+                name: "my-sandbox--web".to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                labels: HashMap::default(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            sandbox_id: "sandbox-1".to_string(),
+            sandbox: "my-sandbox".to_string(),
+            name: "web".to_string(),
+            target_port: 8080,
+            domain: true,
+            authorization_mode: ServiceAuthorizationMode::Strip as i32,
+        };
+        store.put_message(&ep).await.unwrap();
+
+        let found = load_endpoint(&store, "default", "my-sandbox", "web").await;
+        assert!(found.is_ok(), "should find endpoint in correct workspace");
+
+        let not_found = load_endpoint(&store, "staging", "my-sandbox", "web").await;
+        assert!(
+            not_found.is_err(),
+            "should not find endpoint in wrong workspace"
+        );
+    }
+    /// Returns a live upstream plus the sandbox end of the connection. Hold
+    /// the returned half: dropping it closes the upstream.
+    async fn test_upstream() -> (UpstreamSender, tokio::io::DuplexStream) {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let (sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client_io))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (sender, server_io)
+    }
+
+    #[test]
+    fn upstream_pool_key_separates_endpoints_and_ports() {
+        assert_eq!(upstream_pool_key("ep-a", 8080), "ep-a|8080");
+        assert_ne!(
+            upstream_pool_key("ep-a", 8080),
+            upstream_pool_key("ep-b", 8080)
+        );
+        assert_ne!(
+            upstream_pool_key("ep-a", 8080),
+            upstream_pool_key("ep-a", 9090)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_hands_back_a_ready_upstream() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+
+        pool.put("ep-a|8080", sender);
+
+        assert!(
+            pool.take("ep-a|8080").is_some(),
+            "put upstream should be reusable"
+        );
+        assert!(
+            pool.take("ep-a|8080").is_none(),
+            "an upstream in use must not be handed out twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_removes_an_endpoint_left_with_no_upstreams() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+        pool.put("ep-a|8080", sender);
+
+        assert!(pool.take("ep-a|8080").is_some());
+        assert!(
+            !pool.inner.lock().unwrap().idle.contains_key("ep-a|8080"),
+            "an emptied endpoint must not linger until the next sweep"
+        );
+    }
+
+    #[test]
+    fn only_bodyless_requests_are_replayable() {
+        for method in [Method::GET, Method::HEAD] {
+            let mut request = Request::new(Body::empty());
+            *request.method_mut() = method.clone();
+            *request.uri_mut() = "/health".parse().unwrap();
+            request
+                .headers_mut()
+                .insert(header::HOST, HeaderValue::from_static("svc"));
+
+            let replay =
+                replayable_request(&request).expect("bodyless method should be replayable");
+            assert_eq!(*replay.method(), method);
+            assert_eq!(replay.uri().path(), "/health");
+            assert_eq!(replay.headers().get(header::HOST).unwrap(), "svc");
+        }
+
+        let mut post = Request::new(Body::empty());
+        *post.method_mut() = Method::POST;
+        assert!(
+            replayable_request(&post).is_none(),
+            "a request with a body cannot be replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_does_not_hand_out_another_endpoints_upstream() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+
+        pool.put("ep-a|8080", sender);
+
+        assert!(pool.take("ep-b|8080").is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_drops_an_upstream_the_sandbox_closed() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, sandbox) = test_upstream().await;
+        pool.put("ep-a|8080", sender);
+
+        drop(sandbox);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            pool.take("ep-a|8080").is_none(),
+            "a closed upstream must never be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_upstream_recovers_an_unsent_post_for_retry() {
+        let (mut sender, sandbox) = test_upstream().await;
+        drop(sandbox);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut request = Request::new(Body::from("payload"));
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = "/write".parse().unwrap();
+        let mut error = sender
+            .try_send_request(request)
+            .await
+            .expect_err("a closed connection must reject the request");
+        let recovered = error
+            .take_message()
+            .expect("an unsent request must be recoverable for a fresh connection");
+
+        assert_eq!(recovered.method(), Method::POST);
+        assert_eq!(recovered.uri().path(), "/write");
+    }
+
+    #[tokio::test]
+    async fn pool_drops_upstreams_past_the_idle_timeout() {
+        let pool = ServiceUpstreamPool::default();
+        let (sender, _sandbox) = test_upstream().await;
+        pool.inner.lock().unwrap().idle.insert(
+            "ep-a|8080".to_string(),
+            vec![PooledUpstream {
+                sender,
+                idle_since: Instant::now()
+                    .checked_sub(UPSTREAM_IDLE_TIMEOUT + Duration::from_secs(1))
+                    .unwrap(),
+            }],
+        );
+
+        assert!(pool.take("ep-a|8080").is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_caps_idle_upstreams_per_endpoint() {
+        let pool = ServiceUpstreamPool::default();
+        let mut sandboxes = Vec::new();
+        for _ in 0..(UPSTREAM_MAX_IDLE_PER_ENDPOINT + 4) {
+            let (sender, sandbox) = test_upstream().await;
+            sandboxes.push(sandbox);
+            pool.put("ep-a|8080", sender);
+        }
+
+        let held = pool
+            .inner
+            .lock()
+            .unwrap()
+            .idle
+            .get("ep-a|8080")
+            .map_or(0, Vec::len);
+        assert_eq!(held, UPSTREAM_MAX_IDLE_PER_ENDPOINT);
+        // Every connection stayed open, so the cap dropped the surplus rather
+        // than the pool losing entries to closure.
+        assert_eq!(sandboxes.len(), UPSTREAM_MAX_IDLE_PER_ENDPOINT + 4);
+    }
+
+    #[tokio::test]
+    async fn evict_drops_every_upstream_for_an_endpoint() {
+        let pool = ServiceUpstreamPool::default();
+        let (first, _sandbox_a) = test_upstream().await;
+        let (second, _sandbox_b) = test_upstream().await;
+        pool.put("ep-a|8080", first);
+        pool.put("ep-b|8080", second);
+
+        pool.evict("ep-a|8080");
+
+        assert!(pool.take("ep-a|8080").is_none());
+        assert!(
+            pool.take("ep-b|8080").is_some(),
+            "eviction must be scoped to one endpoint"
+        );
+    }
+
+    #[test]
+    fn gateway_ocsf_events_expose_the_structured_event_to_layers() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+
+        let endpoint = endpoint();
+        let expected = build_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        let expected_shorthand = expected.format_shorthand();
+
+        {
+            let _guard = capture.install();
+            emit_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        }
+
+        let seen = capture.events();
+        assert_eq!(seen.len(), 1, "expected exactly one OCSF tracing event");
+        assert_eq!(seen[0].format_shorthand(), expected_shorthand);
+    }
+}

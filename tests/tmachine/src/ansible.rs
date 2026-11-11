@@ -1,0 +1,72 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, ensure};
+use tokio::process::Command;
+
+pub fn requirements_path() -> PathBuf {
+    PathBuf::from(std::env::var("ANSIBLE_CONFIG").unwrap()).with_file_name("requirements.yaml")
+}
+
+pub async fn install_roles() -> Result<()> {
+    let status = Command::new("ansible-galaxy")
+        .arg("role")
+        .arg("install")
+        .arg("--force-with-deps")
+        .arg("--role-file")
+        .arg(requirements_path())
+        .status()
+        .await
+        .context("run ansible-galaxy")?;
+
+    ensure!(status.success(), "ansible-galaxy exited with {status}");
+    Ok(())
+}
+
+pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) -> Result<()> {
+    let mut command = Command::new("ansible-playbook");
+    // Newer systemd guests (Fedora) print OSC 3008 shell-integration markers
+    // on every terminal session: from a profile script for login shells and
+    // from pam_systemd for `become`, which Ansible runs over `ssh -tt`.
+    // Ansible reports them as "Module invocation had junk after the JSON
+    // data". Both emitters skip a dumb terminal, so don't forward the caller's
+    // TERM.
+    command.env("TERM", "dumb");
+    // The VM's SSH forward may not be the inventory's default port.
+    command
+        .arg("--extra-vars")
+        .arg(format!("ansible_port={}", crate::ssh_port()));
+    for (name, path) in inputs {
+        let value = match std::fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.clone(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to resolve input {name:?} from {}", path.display())
+                });
+            }
+        };
+        command
+            .arg("--extra-vars")
+            .arg(format!("{name}={}", value.display()));
+    }
+
+    // Stop ansible-playbook if the caller is dropped, for example when the
+    // runner is cancelled.
+    command.kill_on_drop(true);
+    let status = command
+        .arg(playbook)
+        .status()
+        .await
+        .context("run ansible-playbook")?;
+
+    ensure!(
+        status.success(),
+        "ansible-playbook {} exited with {status}",
+        playbook.display()
+    );
+    Ok(())
+}
