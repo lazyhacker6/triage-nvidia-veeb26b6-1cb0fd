@@ -22,7 +22,7 @@ jobs:
   macos:
     name: macOS Homebrew
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: macos-latest-xlarge
+    runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - name: Ensure VM driver
@@ -113,7 +113,7 @@ jobs:
             fedora:latest \
             bash -lc 'dnf install -y curl dbus-daemon podman systemd && exec /usr/sbin/init'
 
-          for _ in $(seq 1 120); do
+          for _ in $(seq 1 300); do
             if docker exec "${FEDORA_CANARY_CONTAINER}" systemctl list-units --no-pager >/dev/null 2>&1; then
               break
             fi
@@ -126,7 +126,7 @@ jobs:
           done
 
           if ! docker exec "${FEDORA_CANARY_CONTAINER}" systemctl list-units --no-pager >/dev/null 2>&1; then
-            echo "::error::Fedora systemd container did not become reachable within 120s"
+            echo "::error::Fedora systemd container did not become reachable within 300s"
             docker logs "${FEDORA_CANARY_CONTAINER}" >&2 || true
             exit 1
           fi
